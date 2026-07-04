@@ -35,12 +35,6 @@
       "description": "历史记录：已完成的流水线"
     },
     {
-      "method": "GET",
-      "path": "/stats_ui",
-      "type": "ui",
-      "description": "知识→行动转化率仪表盘：全局漏斗 + 沉睡方向 + 类型分布"
-    },
-    {
       "method": "POST",
       "path": "/reclassify",
       "type": "data",
@@ -107,12 +101,6 @@
       "path": "/plan/:source_id",
       "type": "data",
       "description": "获取执行计划（Agent 读取执行）"
-    },
-    {
-      "method": "GET",
-      "path": "/scan_dormant",
-      "type": "data",
-      "description": "扫描沉睡方向（超过N天未启动），返回提醒列表"
     },
     {
       "method": "POST",

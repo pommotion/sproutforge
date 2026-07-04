@@ -10,10 +10,7 @@ import sqlite3
 import time
 import uuid
 
-from remio_sdk import create_aapp_logger, get_state, router, run_prompt, set_state, syscall
-
-# 多目的地保存模块
-from sprout_save_utils import detect_platform, save_sprout_to_vault
+from remio_sdk import create_aapp_logger, router, run_prompt, syscall
 
 # ---------------------------------------------------------------------------
 # Paths & logger
@@ -68,7 +65,6 @@ def _init_db(db):
             action_subtype TEXT DEFAULT '',
             priority TEXT DEFAULT 'medium',
             status TEXT DEFAULT 'pending',
-            reason TEXT DEFAULT '',
             exec_prompt TEXT DEFAULT '',
             result_ref TEXT DEFAULT '',
             result_summary TEXT DEFAULT '',
@@ -76,11 +72,6 @@ def _init_db(db):
             updated_at INTEGER NOT NULL
         )
     ''')
-    # Migration: add reason column if missing (existing DBs)
-    try:
-        db.exec("ALTER TABLE sprout_actions ADD COLUMN reason TEXT DEFAULT ''")
-    except Exception:
-        pass
     db.exec('''
         CREATE TABLE IF NOT EXISTS pipelines (
             id TEXT PRIMARY KEY,
@@ -176,13 +167,13 @@ def _extract_directions_from_note(note_content):
         section_text = rest
 
     directions = []
-    # Split on: ### 方向 N headers, or numbered (1-99)/bulleted list items
-    for block in re.split(r'\n(?=###\s*方向\s*\d{1,2}[：:]|\d{1,2}[\.\)\u3001\]]\s+|^[\-•\*]\s+)', section_text, flags=re.MULTILINE):
+    # Split on: ### 方向 N headers, or numbered/bulleted list items
+    for block in re.split(r'\n(?=###\s*方向\s*\d+|\d+[\.\)、\]]|\-|•|\*)', section_text):
         block = block.strip()
         if not block:
             continue
         # Remove leading ### 方向 N： prefix, then number/bullet markers
-        clean = re.sub(r'^(###\s*方向\s*\d{1,2}[：:]\s*)?(\d{1,2}[\.\)\u3001\]]?|[\-•\*]\s*)*', '', block).strip()
+        clean = re.sub(r'^(###\s*方向\s*\d+[：:]\s*)?(\d+[\.\)、\]]?|[\-•\*]\s*)*', '', block).strip()
         if clean and len(clean) > 5:
             directions.append(clean)
     return directions
@@ -211,58 +202,14 @@ Output a JSON array of strings (each string is one direction).'''
 def _ai_extract_directions(note_content, note_title=''):
     """When no 🌿 section is found, use AI to extract directions from full note.
     Works with any note type: sprout notes, regular notes, article summaries, etc.
-
-    Returns (directions, error_message).
-    - On success: ([dir1, dir2, ...], '')
-    - On failure: ([], 'actual error string for debugging')
     """
     # Truncate to avoid token limits (keep first ~8000 chars)
     truncated = note_content[:8000]
-
-    # --- Attempt 1: full-text extraction ---
-    dirs, err = _ai_extract_single(
-        _AI_EXTRACT_USER.format(title=note_title or '(无标题)', content=truncated),
-        _AI_EXTRACT_SYSTEM,
-    )
-    if dirs:
-        return dirs, ''
-    LOGGER.warn('ai_extract.attempt1', f'full-text extraction failed: {err}', {})
-
-    # --- Attempt 2: simplified retry with shorter content ---
-    simplified_prompt = f'以下是一篇笔记的标题和内容。请提取 3-8 个可执行的行动方向。\n\n标题：{note_title or "(无标题)"}\n\n内容：\n{note_content[:4000]}\n\n请只输出 JSON 数组，每个元素是一个字符串。'
-    simplified_system = 'You are a helpful assistant. Extract actionable directions from notes. Output ONLY a JSON array of strings.'
-    dirs, err2 = _ai_extract_single(simplified_prompt, simplified_system)
-    if dirs:
-        LOGGER.info('ai_extract.retry', 'simplified retry succeeded', {})
-        return dirs, ''
-    LOGGER.warn('ai_extract.attempt2', f'simplified retry failed: {err2}', {})
-
-    # --- Attempt 3: degraded per-section extraction ---
-    sections = re.split(r'\n(?=#{1,3}\s)', note_content)
-    all_dirs = []
-    for section in sections:
-        section = section.strip()
-        if len(section) < 20:
-            continue
-        dirs_s, _ = _ai_extract_single(
-            f'从这段内容中提取可执行方向（1-3个）：\n\n{section[:2000]}\n\n输出 JSON 数组。',
-            simplified_system,
-        )
-        if dirs_s:
-            all_dirs.extend(dirs_s)
-    if all_dirs:
-        LOGGER.info('ai_extract.degraded', f'per-section extraction found {len(all_dirs)} dirs', {})
-        return all_dirs[:20], ''
-
-    return [], f'full-text: {err} | retry: {err2} | degraded: no sections yielded results'
-
-
-def _ai_extract_single(prompt, system_prompt):
-    """Single AI extraction call. Returns (directions, error_string)."""
+    prompt = _AI_EXTRACT_USER.format(title=note_title or '(无标题)', content=truncated)
     try:
         result = run_prompt(
             prompt=prompt,
-            system_prompt=system_prompt,
+            system_prompt=_AI_EXTRACT_SYSTEM,
             timeout_ms=90000,
         )
         text = result if isinstance(result, str) else str(result)
@@ -270,18 +217,17 @@ def _ai_extract_single(prompt, system_prompt):
         if text.startswith('```'):
             text = re.sub(r'^```(?:json)?\s*', '', text)
             text = re.sub(r'\s*```$', '', text)
+        # Extract first JSON array fragment (handles trailing text after ])
         array_match = re.search(r'\[.*\]', text, re.DOTALL)
         if array_match:
             text = array_match.group()
         parsed = json.loads(text)
         if isinstance(parsed, list):
-            dirs = [str(d).strip() for d in parsed if str(d).strip()]
-            return dirs, ''
-        return [], 'AI returned non-list JSON'
-    except json.JSONDecodeError as e:
-        return [], f'JSON parse failed: {e}'
+            return [str(d).strip() for d in parsed if str(d).strip()]
+        return []
     except Exception as e:
-        return [], str(e)
+        LOGGER.error('ai_extract', 'AI direction extraction failed', {'error': str(e)})
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -290,53 +236,32 @@ def _ai_extract_single(prompt, system_prompt):
 
 # Rule-based keyword matching. Order matters: earlier rules take priority.
 _CLASSIFY_RULES = [
-    ('research', ['调研', '研究', '深入了解', '评估', '分析现状', '深入分析', '趋势分析', '技术原理',
-                 '探索', '挖掘', '洞察', 'review', 'research', 'investigate', 'study', 'analyze',
-                 'evaluate', 'deep dive', 'explore', 'understand']),
-    ('survey',   ['多源', '竞品', '横向对比', '行业报告', '市场调研', '竞品分析',
-                 '对比分析', '横向评测', '评测', 'survey', 'compare', 'benchmark', 'competitive',
-                 'market research', 'landscape']),
-    ('prd',      ['设计方案', '架构设计', '产品需求', '功能设计', '规划方案', '产品设计',
-                 'aApp 设计', '仪表盘', '可视化层', 'design', 'build', 'create', 'develop',
-                 'prd', 'spec', 'blueprint', 'prototype', 'implement']),
-    ('goal',     ['目标对齐', '拆解任务', '路线图', '对齐目标', '里程碑规划',
-                 '方法论', '策略', '框架', 'checklist', 'plan', 'roadmap', 'milestone',
-                 'strategy', 'okr', 'workflow', 'pipeline']),
-    ('archive',  ['归档', '参考', '概念框架', '备查', '概念笔记', '知识地图',
-                 '存档', '收藏', 'archive', 'reference', 'bookmark', 'note', 'glossary']),
+    ('research', ['调研', '研究', '深入了解', '评估', '分析现状', '深入分析', '趋势分析', '技术原理']),
+    ('survey',   ['多源', '竞品', '横向对比', '行业报告', '市场调研', '竞品分析']),
+    ('prd',      ['设计方案', '架构设计', '产品需求', '功能设计', '规划方案', '产品设计']),
+    ('goal',     ['目标对齐', '拆解任务', '路线图', '对齐目标', '里程碑规划']),
+    ('archive',  ['归档', '参考', '概念框架', '备查', '概念笔记', '知识地图']),
 ]
 
-_PRIORITY_RULES_HIGH = ['紧急', '立即', '核心', '关键', '首要', '最重要', '高优', 'urgent', 'critical', 'asap', 'must', 'blocker']
-_PRIORITY_RULES_LOW  = ['归档', '参考', '备查', '后续', '可选', '低优先', '低优', 'later', 'optional', 'nice to have', 'someday']
+_PRIORITY_RULES_HIGH = ['紧急', '立即', '核心', '关键', '首要', '最重要']
+_PRIORITY_RULES_LOW  = ['归档', '参考', '备查', '后续', '可选', '低优先']
 
 
 def _pre_classify(title, description):
     """Rule-based pre-classification using keyword matching.
     action_type matches against title only (avoids false positives from long descriptions).
-    Chinese keywords: substring match. English keywords: word-boundary regex match.
     priority matches against full text (title + description).
     Returns (action_type, priority) or (None, None) if no rule matches.
     """
-    title_str = title
     title_lower = title.lower()
-    full_text = f'{title} {description}'
-    full_lower = full_text.lower()
-
+    full_text = f'{title} {description}'.lower()
     # Determine action_type — only match against title to avoid false positives
     action_type = None
     for atype, keywords in _CLASSIFY_RULES:
         for kw in keywords:
-            kw_l = kw.lower()
-            # Chinese keyword: substring match (CJK has no word boundaries)
-            if re.search(r'[\u4e00-\u9fff]', kw):
-                if kw in title_str:
-                    action_type = atype
-                    break
-            else:
-                # English keyword: word-boundary match to avoid partial hits
-                if re.search(rf'\b{re.escape(kw_l)}\b', title_lower):
-                    action_type = atype
-                    break
+            if kw.lower() in title_lower:
+                action_type = atype
+                break
         if action_type:
             break
 
@@ -558,56 +483,8 @@ def _type_badge(action_type):
     return f'{meta.get("icon", "❓")} {meta.get("label", action_type)}'
 
 
-def _progress_bar(done, total, width=10):
-    """Visual emoji progress bar: ████░░░░░░ 42%"""
-    if total <= 0:
-        return '░' * width
-    filled = int(done / total * width)
-    bar = '█' * filled + '░' * (width - filled)
-    pct = int(done / total * 100)
-    return f'{bar} {pct}%'
-
-
-def _type_distribution_bar(actions):
-    """Compact type distribution summary: 🔍2 📋3 🎯1 ⚡4"""
-    counts = {}
-    for a in actions:
-        t = a.get('action_type', 'exec')
-        counts[t] = counts.get(t, 0) + 1
-    # Order by ACTION_META keys
-    parts = []
-    for t in ['research', 'survey', 'prd', 'goal', 'exec', 'archive']:
-        if t in counts:
-            icon = ACTION_META.get(t, {}).get('icon', '❓')
-            parts.append(f'{icon}{counts[t]}')
-    return ' '.join(parts)
-
-
-def _status_summary(actions):
-    """Status breakdown: ✅3 🔄2 ⏸️2"""
-    counts = {'completed': 0, 'running': 0, 'pending': 0, 'queued': 0, 'skipped': 0, 'failed': 0}
-    for a in actions:
-        s = a.get('status', 'pending')
-        if s in counts:
-            counts[s] += 1
-    parts = []
-    if counts['completed']:
-        parts.append(f"✅{counts['completed']}")
-    if counts['running']:
-        parts.append(f"🔄{counts['running']}")
-    if counts['queued']:
-        parts.append(f"⏭️{counts['queued']}")
-    if counts['pending']:
-        parts.append(f"⏸️{counts['pending']}")
-    if counts['skipped']:
-        parts.append(f"⏭️{counts['skipped']}")
-    if counts['failed']:
-        parts.append(f"❌{counts['failed']}")
-    return ' '.join(parts) if parts else '—'
-
-
 def _format_direction_card(action):
-    """Render a single action as a list item with status/type badges + classification reason."""
+    """Render a single action as a list item with status/type badges."""
     status_label, status_style = _status_badge(action.get('status', 'pending'))
     type_label = _type_badge(action.get('action_type', 'exec'))
     priority = action.get('priority', 'medium')
@@ -618,16 +495,9 @@ def _format_direction_card(action):
     if len(desc) > 120:
         desc = desc[:120] + '...'
 
-    # Build description with classification reason
-    reason = action.get('reason', '')
-    if reason:
-        description_text = f'{type_label} · {desc}\n💡 分类依据：{reason}'
-    else:
-        description_text = f'{type_label} · {desc}'
-
     item = {
         'title': f'{pri_emoji} {title}',
-        'description': description_text,
+        'description': f'{type_label} · {desc}',
         'badge': status_label,
         'badgeStyle': status_style,
     }
@@ -719,18 +589,6 @@ def _home(params):
                 ],
                 'colCount': 2,
             },
-            {
-                'kind': 'row',
-                'items': [
-                    {
-                        'kind': 'button',
-                        'label': '📈 转化仪表盘',
-                        'style': 'default',
-                        'action': {'method': 'GET', 'path': '/stats_ui', 'prompt': '查看知识→行动转化仪表盘', 'params': {}}
-                    }
-                ],
-                'colCount': 2,
-            },
         ]
     }
 
@@ -768,9 +626,9 @@ def _extract(params):
         if not raw_directions:
             # Fallback: no 🌿 section found — use AI to extract directions from full note
             LOGGER.info('extract.fallback', 'no sprout section, trying AI full-text extraction', {'note_id': note_id})
-            raw_directions, ai_error = _ai_extract_directions(note_content, note_title or '')
+            raw_directions = _ai_extract_directions(note_content, note_title or '')
             if not raw_directions:
-                return {'error': 'no_directions', 'message': f'未找到「🌿 发芽扩展」章节，AI 也无法从笔记内容中提取有效方向。详细原因：{ai_error}'}
+                return {'error': 'no_directions', 'message': '未找到「🌿 发芽扩展」章节，AI 也无法从笔记内容中提取有效方向'}
 
         LOGGER.info('extract.directions', f'extracted {len(raw_directions)} directions', {'note_id': note_id})
 
@@ -836,10 +694,10 @@ def _extract(params):
             exec_prompt = _build_exec_prompt(action_type, cls.get('action_subtype', ''), title, description, context_str)
 
             db.exec(
-                'INSERT INTO sprout_actions (id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, reason, exec_prompt, result_ref, result_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [aid, source_id, note_id, i + 1, title, description, action_type, cls.get('action_subtype', ''), priority, 'pending', cls.get('reason', ''), exec_prompt, '', '', now, now]
+                'INSERT INTO sprout_actions (id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, exec_prompt, result_ref, result_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [aid, source_id, note_id, i + 1, title, description, action_type, cls.get('action_subtype', ''), priority, 'pending', exec_prompt, '', '', now, now]
             )
-            created.append({'id': aid, 'direction_index': i + 1, 'title': title, 'action_type': action_type, 'priority': priority, 'reason': cls.get('reason', '')})
+            created.append({'id': aid, 'direction_index': i + 1, 'title': title, 'action_type': action_type, 'priority': priority})
 
         _update_pipeline_progress(db, source_id or note_id)
 
@@ -880,10 +738,7 @@ def _pipeline_detail(params):
         ]
         if meta_source and meta_source.get('url'):
             components.append({'kind': 'text', 'text': f'📎 来源：{meta_source.get("platform", "")} — {meta_source["url"]}'})
-        # Visual progress + type/status distribution
-        type_dist = _type_distribution_bar(actions)
-        status_sum = _status_summary(actions)
-        components.append({'kind': 'text', 'text': f'{_progress_bar(done, total)}\n{type_dist} · {status_sum}'})
+        components.append({'kind': 'text', 'text': f'进度：{done}/{total} ({pct}%)'})
         components.append({'kind': 'divider'})
 
         list_items = [_format_direction_card(a) for a in actions]
@@ -946,15 +801,10 @@ def _dashboard(params):
             status_map = {'draft': '草稿', 'queued': '待执行', 'running': '执行中'}
             meta = json.loads(p.get('meta', '{}') or '{}')
             title = meta.get('note_title', p.get('source_id', p.get('note_id', ''))[:12])
-            # Query actions for type distribution
-            pid_key = p.get('source_id') or p.get('note_id', '')
-            p_actions = db.query('SELECT action_type, status FROM sprout_actions WHERE source_id = :sid OR note_id = :nid', {'sid': pid_key, 'nid': pid_key})
-            type_dist = _type_distribution_bar(p_actions)
-            status_sum = _status_summary(p_actions)
 
             list_items.append({
                 'title': title,
-                'description': f'{_progress_bar(done, total)}\n{type_dist} · {status_sum}',
+                'description': f'进度 {done}/{total} ({pct}%)',
                 'badge': status_map.get(p.get('status'), p.get('status')),
                 'badgeStyle': 'primary' if p.get('status') == 'running' else 'default',
                 'actions': [{
@@ -998,7 +848,7 @@ def _history(params):
             ts = time.strftime('%Y-%m-%d', time.localtime(p.get('updated_at', 0)))
             list_items.append({
                 'title': title,
-                'description': f'{_progress_bar(done, total)} · {ts}',
+                'description': f'✅ {done}/{total} 完成 · {ts}',
                 'badge': '已完成',
                 'badgeStyle': 'success',
                 'actions': [{
@@ -1014,138 +864,6 @@ def _history(params):
             })
 
         components.append({'kind': 'list', 'items': list_items})
-        return {'components': components}
-    finally:
-        db.close()
-
-
-@router.route('GET', '/stats_ui')
-def _stats(params):
-    """知识→行动转化率仪表盘。
-
-    展示：全局漏斗、类型分布、沉睡方向（提取超过3天仍未执行）。
-    概念升级：让用户看到「哪些灵感被浪费了」。"""
-    db = _open_db()
-    try:
-        # --- 全局漏斗 ---
-        total_pipelines = db.query('SELECT COUNT(*) as c FROM pipelines')[0]['c']
-        total_actions = db.query('SELECT COUNT(*) as c FROM sprout_actions')[0]['c']
-        started = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status IN ('running','completed','skipped')")[0]['c']
-        completed = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'completed'")[0]['c']
-        skipped = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'skipped'")[0]['c']
-
-        # --- 类型分布 ---
-        type_rows = db.query(
-            'SELECT action_type, COUNT(*) as c, '
-            'SUM(CASE WHEN status="completed" THEN 1 ELSE 0 END) as done '
-            'FROM sprout_actions GROUP BY action_type ORDER BY c DESC'
-        )
-
-        # --- 沉睡方向：提取超过3天仍 pending 的 ---
-        now_ts = _now()
-        cutoff = now_ts - 3 * 86400
-        dormant = db.query(
-            'SELECT * FROM sprout_actions '
-            'WHERE status = "pending" AND created_at < :cutoff '
-            'ORDER BY created_at ASC LIMIT 10',
-            {'cutoff': cutoff}
-        )
-
-        components = [{'kind': 'text', 'text': '📈 知识→行动转化仪表盘', 'heading': 2}]
-
-        # --- 漏斗可视化 ---
-        def _safe_pct(num, den):
-            return int(num / den * 100) if den > 0 else 0
-
-        funnel_rate = _safe_pct(completed, total_actions)
-        start_rate = _safe_pct(started, total_actions)
-
-        funnel_text = (
-            f'📝 笔记提取：{total_pipelines} 篇 → '
-            f'🌱 方向：{total_actions} 个\n'
-            f'🚀 已启动：{started}/{total_actions} ({start_rate}%) '
-            f'{_progress_bar(started, total_actions)}\n'
-            f'✅ 已完成：{completed}/{total_actions} ({funnel_rate}%) '
-            f'{_progress_bar(completed, total_actions)}\n'
-            f'⏭️ 已跳过：{skipped} 个'
-        )
-        components.append({'kind': 'text', 'text': '🎯 转化漏斗', 'heading': 4})
-        components.append({'kind': 'text', 'text': funnel_text})
-
-        # --- 漏斗流失分析 ---
-        pending_count = total_actions - started
-        if pending_count > 0:
-            components.append({'kind': 'text', 'text': f'⚠️ 有 {pending_count} 个方向提取后从未启动——这些是「被浪费的灵感」'})
-
-        # --- 类型分布 + 各类型完成率 ---
-        if type_rows:
-            components.append({'kind': 'divider'})
-            components.append({'kind': 'text', 'text': '🏷️ 按类型分布', 'heading': 4})
-            type_lines = []
-            for r in type_rows:
-                atype = r['action_type'] or 'unknown'
-                cnt = r['c']
-                done = r['done'] or 0
-                badge = _type_badge(atype)
-                pct = _safe_pct(done, cnt)
-                type_lines.append(f'{badge} {atype}：{cnt} 个 → ✅{done} ({pct}%)')
-            components.append({'kind': 'text', 'text': '\n'.join(type_lines)})
-
-        # --- 沉睡方向 ---
-        if dormant:
-            components.append({'kind': 'divider'})
-            components.append({'kind': 'text', 'text': f'💤 沉睡方向（提取超过3天未执行）', 'heading': 4})
-            dormant_items = []
-            for a in dormant:
-                days_ago = int((now_ts - a['created_at']) / 86400)
-                title = a.get('title', '')[:40]
-                atype_badge = _type_badge(a.get('action_type', ''))
-                dormant_items.append({
-                    'title': f'{atype_badge} {title}',
-                    'description': f'⏰ 提取于 {days_ago} 天前 · 状态：待审',
-                    'badge': f'{days_ago}d',
-                    'badgeStyle': 'danger',
-                    'actions': [{
-                        'label': '去执行',
-                        'style': 'primary',
-                        'action': {
-                            'method': 'POST',
-                            'path': '/execute',
-                            'params': {'action_id': a['id']},
-                            'prompt': f'执行沉睡方向：{title}',
-                            'aapp_id': 'sproutforge',
-                        }
-                    }]
-                })
-            components.append({'kind': 'list', 'items': dormant_items})
-
-        # --- 总结洞察 ---
-        components.append({'kind': 'divider'})
-        if total_actions == 0:
-            insight = '还没有任何方向被提取。从一篇笔记开始吧！'
-        elif funnel_rate >= 80:
-            insight = f'🔥 转化率 {funnel_rate}%——执行力很强！'
-        elif funnel_rate >= 50:
-            insight = f'💪 转化率 {funnel_rate}%——还不错，继续推进剩余方向。'
-        elif funnel_rate >= 20:
-            insight = f'🤔 转化率 {funnel_rate}%——有灵感但执行力跟不上，先完成最重要的。'
-        else:
-            insight = f'❄️ 转化率仅 {funnel_rate}%——大量灵感在沉睡。挑一个最重要的开始吧！'
-        components.append({'kind': 'text', 'text': insight})
-
-        # --- 底部导航 ---
-        components.append({'kind': 'divider'})
-        components.append({
-            'kind': 'row',
-            'items': [
-                {'kind': 'button', 'label': '🏠 主页', 'style': 'default',
-                 'action': {'method': 'GET', 'path': '/', 'prompt': '回到主页', 'params': {}}},
-                {'kind': 'button', 'label': '📊 看板', 'style': 'default',
-                 'action': {'method': 'GET', 'path': '/dashboard_ui', 'prompt': '查看看板', 'params': {}}},
-            ],
-            'colCount': 2,
-        })
-
         return {'components': components}
     finally:
         db.close()
@@ -1300,44 +1018,6 @@ def _batch_execute(params):
         db.close()
 
 
-def _extract_note_id(ref):
-    """从 result_ref 字符串中提取 note_id。
-
-    支持格式：
-      - note://xxx
-      - :remio-inlink[title]{#xxx}
-      - 纯 note_id (20+ 字符的字母数字串)
-      - 文件路径（不提取 note_id，返回 None）
-    """
-    if not ref:
-        return ''
-    # note://xxx
-    m = re.search(r'note://([a-z0-9]+)', ref)
-    if m:
-        return m.group(1)
-    # :remio-inlink[...]{#xxx}
-    m = re.search(r'\{#([a-z0-9]+)\}', ref)
-    if m:
-        return m.group(1)
-    # 纯 ID（16+ 字符的字母数字串，适配 remio noteId 格式）
-    m = re.match(r'^([a-z0-9]{16,})$', ref.strip())
-    if m:
-        return m.group(1)
-    return ''
-
-
-def _add_to_sprout_collection(note_id, collection_name='SproutForge 产出'):
-    """把笔记归入 SproutForge collection，出错不抛异常。"""
-    if not note_id:
-        return False
-    try:
-        syscall('add_note_to_collection', {'noteId': note_id, 'title': collection_name})
-        return True
-    except Exception as e:
-        LOGGER.error('add_to_collection', f'failed to add note {note_id} to collection', {'error': str(e)})
-        return False
-
-
 @router.route('POST', '/complete')
 def _complete(params):
     action_id = (params.get('action_id') or '').strip()
@@ -1363,12 +1043,6 @@ def _complete(params):
 
         LOGGER.info('complete', f'action {action_id} completed', {'result_ref': result_ref[:80]})
 
-        # ✅ 立即把成果笔记归入 collection，不要等 /link-results
-        result_note_id = _extract_note_id(result_ref)
-        if result_note_id:
-            _add_to_sprout_collection(result_note_id)
-            LOGGER.info('complete.collection', f'added result note {result_note_id} to SproutForge collection')
-
         # Check if all done → send chat message
         source_id = action.get('source_id') or action.get('note_id')
         remaining = db.query("SELECT COUNT(*) as cnt FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) AND status NOT IN ('completed', 'skipped')", {'sid': source_id, 'nid': source_id})
@@ -1379,12 +1053,7 @@ def _complete(params):
             except Exception:
                 pass
 
-        return {
-            'action_id': action_id,
-            'status': 'completed',
-            'result_ref': result_ref,
-            'result_note_added_to_collection': bool(result_note_id),
-        }
+        return {'action_id': action_id, 'status': 'completed', 'result_ref': result_ref}
     finally:
         db.close()
 
@@ -1521,25 +1190,19 @@ def _link_results(params):
                                 append_section += f' → {ref[:60]}'
                         append_section += '\n'
 
-                    syscall('update_note', {'noteId': note_id, 'append': append_section})
+                    syscall('update_note', {'noteId': note_id, 'content': orig_content + append_section})
                     appended = True
             except Exception as e:
                 LOGGER.error('link.update_note', 'failed to update original note', {'error': str(e)})
 
-        # Add all notes to collection: original note + summary note + each action's result note
+        # Add both notes to collection
         collection_name = 'SproutForge 产出'
-        notes_to_add = [note_id, summary_note_id]
-        # 也把每个方向产出的成果笔记归入
-        for a in actions:
-            if a.get('status') == 'completed' and a.get('result_ref'):
-                rid = _extract_note_id(a['result_ref'])
-                if rid and rid not in notes_to_add:
-                    notes_to_add.append(rid)
-        added_count = 0
-        for nid in notes_to_add:
-            if _add_to_sprout_collection(nid, collection_name):
-                added_count += 1
-        LOGGER.info('link_results.collection', f'added {added_count}/{len(notes_to_add)} notes to collection', {'note_ids': notes_to_add})
+        for nid in [note_id, summary_note_id]:
+            if nid:
+                try:
+                    syscall('add_note_to_collection', {'noteId': nid, 'collectionTitle': collection_name})
+                except Exception:
+                    pass
 
         # Update pipeline
         if p:
@@ -1547,76 +1210,6 @@ def _link_results(params):
             db.exec('UPDATE pipelines SET summary_note_id = ?, status = ?, updated_at = ? WHERE id = ?', [summary_note_id, 'completed', now, p['id']])
 
         LOGGER.info('link_results', 'results linked', {'note_id': note_id, 'summary_id': summary_note_id, 'appended': appended})
-
-        # 多目的地保存：Obsidian + Get笔记（汇总笔记分发到内容库）
-        vault_status = ''
-        try:
-            sf_platform = source_meta.get('platform', '') if source_meta else ''
-            if not sf_platform or sf_platform not in ('weibo', 'wechat', 'bilibili', 'youtube'):
-                sf_platform = detect_platform(summary_body, note_title)
-            vault_result = save_sprout_to_vault(
-                title=note_title or source_id,
-                content=summary_body,
-                platform=sf_platform,
-                source_url=source_meta.get('url', '') if source_meta else '',
-                source_note_id=summary_note_id,
-            )
-            parts = []
-            if vault_result.get('obsidian_path'):
-                parts.append('Obsidian')
-            if vault_result.get('getnote_added'):
-                parts.append('Get笔记')
-            vault_status = ' + '.join(parts) if parts else '跳过'
-
-            # 标记待 Agent 处理飞书写入
-            feishu_meta = vault_result.get('feishu_meta', {})
-            feishu_meta['remio_note_id'] = summary_note_id
-            feishu_meta['obsidian_path'] = vault_result.get('obsidian_path', '')
-            state = get_state()
-            pending_feishu = state.get('pending_feishu', [])
-            pending_feishu.append(feishu_meta)
-            pending_feishu = pending_feishu[-50:]
-            state['pending_feishu'] = pending_feishu
-            set_state(state)
-
-            LOGGER.info('link_results.multi_save', f'platform={sf_platform} vault={vault_status}', {})
-        except Exception as e:
-            vault_status = f'失败: {e}'
-            LOGGER.error('link_results.multi_save', f'failed: {e}', {})
-
-        # --- 方向 C：执行成果反哺知识库 ---
-        # 检测知识库中是否有与本次成果相关的旧笔记
-        related_notes = []
-        try:
-            # 用完成方向的标题作为检索词
-            search_terms = [a['title'][:30] for a in completed[:3] if a.get('title')]
-            if search_terms:
-                sr = syscall('search_notes', {'query': ' '.join(search_terms), 'limit': 5})
-                sr_data = sr.get('data', sr) if isinstance(sr, dict) else {}
-                results = sr_data.get('results', sr_data) if isinstance(sr_data, dict) else sr_data
-                if isinstance(results, list):
-                    for r in results:
-                        rid = r.get('id', r.get('noteId', ''))
-                        rtitle = r.get('title', '')
-                        # 排除当前笔记自身和汇总笔记
-                        if rid and rid != note_id and rid != summary_note_id and rtitle:
-                            related_notes.append({'id': rid, 'title': rtitle})
-        except Exception as e:
-            LOGGER.error('link.rag_feedback', 'failed to search related notes', {'error': str(e)})
-
-        # 如果找到相关旧笔记，追加到汇总笔记
-        if related_notes:
-            try:
-                feedback_section = '\n\n---\n## 🔄 相关旧笔记\n\n'
-                feedback_section += '以下知识库笔记可能与本次成果相关，建议检查是否需要更新：\n\n'
-                for rn in related_notes[:5]:
-                    feedback_section += f'- :remio-inlink[{rn["title"]}]{{#{rn["id"]}}}\n'
-                if summary_note_id:
-                    syscall('update_note', {'noteId': summary_note_id, 'append': feedback_section})
-                LOGGER.info('link.rag_feedback', 'found related notes', {'count': len(related_notes)})
-            except Exception as e:
-                LOGGER.error('link.rag_feedback', 'failed to append related notes', {'error': str(e)})
-
         return {
             'source_id': source_id,
             'note_id': note_id,
@@ -1625,107 +1218,6 @@ def _link_results(params):
             'original_note_appended': appended,
             'completed_count': len(completed),
             'total_count': len(actions),
-            'related_notes_found': len(related_notes),
-            'notes_added_to_collection': added_count,
-            'vault_status': vault_status,
-        }
-    finally:
-        db.close()
-
-
-# ---------------------------------------------------------------------------
-# 方向 B：沉睡方向扫描（可被 scheduler 定时调用）
-# ---------------------------------------------------------------------------
-
-@router.route('GET', '/scan_dormant')
-def _scan_dormant(params):
-    """扫描沉睡方向：提取超过 N 天仍未启动的方向。
-
-    可被 scheduler aApp 定时调用，实现「自主提醒」。
-    返回沉睡方向列表 + 汇总统计，供 Agent 生成提醒消息。
-    """
-    days = int(params.get('days', 3))
-    db = _open_db()
-    try:
-        now_ts = _now()
-        cutoff = now_ts - days * 86400
-
-        # 查找沉睡方向
-        dormant = db.query(
-            'SELECT a.*, p.meta as p_meta '
-            'FROM sprout_actions a '
-            'LEFT JOIN pipelines p ON (a.source_id = p.source_id OR a.note_id = p.note_id) '
-            'WHERE a.status = "pending" AND a.created_at < :cutoff '
-            'ORDER BY a.created_at ASC LIMIT 50',
-            {'cutoff': cutoff}
-        )
-
-        if not dormant:
-            return {
-                'status': 'ok',
-                'message': f'没有沉睡方向（超过 {days} 天未执行）',
-                'dormant_count': 0,
-                'dormant': []
-            }
-
-        # 按笔记分组
-        by_note = {}
-        for a in dormant:
-            key = a.get('source_id') or a.get('note_id', '')
-            meta_str = a.get('p_meta', '{}') or '{}'
-            try:
-                meta = json.loads(meta_str)
-            except Exception:
-                meta = {}
-            note_title = meta.get('note_title', key[:20])
-            if key not in by_note:
-                by_note[key] = {'note_id': a.get('note_id', ''), 'note_title': note_title, 'actions': []}
-            days_ago = int((now_ts - a['created_at']) / 86400)
-            by_note[key]['actions'].append({
-                'action_id': a['id'],
-                'title': a.get('title', '')[:50],
-                'action_type': a.get('action_type', ''),
-                'priority': a.get('priority', ''),
-                'days_ago': days_ago,
-            })
-
-        # 构建提醒消息
-        total = len(dormant)
-        note_count = len(by_note)
-        oldest = max(int((now_ts - a['created_at']) / 86400) for a in dormant)
-
-        reminder = f'💤 SproutForge 提醒：你有 {total} 个方向提取后超过 {days} 天未执行（来自 {note_count} 篇笔记），最早已沉睡 {oldest} 天。'
-
-        # 构建精简列表
-        dormant_list = []
-        for key, info in by_note.items():
-            for act in info['actions']:
-                dormant_list.append({
-                    'note_title': info['note_title'],
-                    'note_id': info['note_id'],
-                    'action_id': act['action_id'],
-                    'title': act['title'],
-                    'action_type': act['action_type'],
-                    'priority': act['priority'],
-                    'days_ago': act['days_ago'],
-                })
-
-        LOGGER.info('scan_dormant', f'found {total} dormant actions across {note_count} notes', {'days': days})
-
-        return {
-            'status': 'ok',
-            'message': reminder,
-            'dormant_count': total,
-            'note_count': note_count,
-            'oldest_days': oldest,
-            'dormant': dormant_list,
-            'action': {
-                'method': 'GET',
-                'path': '/stats_ui',
-                'prompt': '查看转化仪表盘',
-                'params': {},
-                'aapp_id': 'sproutforge',
-            },
         }
     finally:
         db.close()

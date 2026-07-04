@@ -71,8 +71,6 @@ SproutForge 采用**规则预分类 + AI fallback** 的双层机制：
 - `GET /pipeline/:source_id` [UI] — 单条流水线详情：方向列表 + 进度
 - `GET /dashboard_ui` [UI] — 全局看板：进行中的流水线
 - `GET /history_ui` [UI] — 历史记录：已完成的流水线
-- `GET /stats_ui` [UI] — 知识→行动转化仪表盘：全局漏斗 + 类型分布 + 沉睡方向
-- `GET /scan_dormant` — 扫描沉睡方向（超过N天未执行），可被 scheduler 定时调用
 
 ### Data 端点
 
@@ -164,11 +162,7 @@ params: action_id=<该方向的id>, result_ref=<成果note_id或URL>, result_sum
 POST /link-results
 params: source_id=<source_id>
 ```
-这会自动：创建汇总笔记 → 在原笔记追加「⚡ 执行成果」章节 → 两个笔记加入 Collection → **汇总笔记分发到 Obsidian + Get笔记**（v3 新增，按来源平台路由）。
-
-#### 多目的地保存（v3 新增）
-
-`/link-results` 创建汇总笔记后，会自动根据 `source_meta.platform` 将汇总笔记分发到 Obsidian + Get笔记。与 sprout-notes 共享相同的路由配置和保存模块。
+这会自动：创建汇总笔记 → 在原笔记追加「⚡ 执行成果」章节 → 两个笔记加入 Collection。
 
 ### 中断恢复
 

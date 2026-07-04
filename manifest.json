@@ -7,7 +7,7 @@
   },
   "icon": "🌱",
   "type": "aapp",
-  "version": "2",
+  "version": "1",
   "developer": "violin",
   "description": "从素材到执行的一体化入口。粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。",
   "descriptionI18n": {
@@ -47,15 +47,6 @@
         "method": "GET",
         "path": "/history_ui",
         "prompt": "查看 SproutForge 历史记录"
-      }
-    },
-    {
-      "label": "转化仪表盘",
-      "labelI18n": { "zh-CN": "转化仪表盘", "en-US": "Stats" },
-      "action": {
-        "method": "GET",
-        "path": "/stats_ui",
-        "prompt": "查看知识→行动转化仪表盘"
       }
     }
   ]
