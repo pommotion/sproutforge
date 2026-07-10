@@ -1,6 +1,6 @@
 ---
 name: sproutforge
-description: "从素材到执行的一体化入口：粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。v4 新增 KB-aware：方向提取时自动检索知识库，标注与已有笔记的关系（新增/更新/深化），执行时注入关联笔记上下文。"
+description: "从素材到执行的一体化入口：粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。"
 ---
 
 # SproutForge 发芽锻造器
@@ -63,20 +63,6 @@ SproutForge 采用**规则预分类 + AI fallback** 的双层机制：
    - 用户在 pipeline 详情页点击「重分类」按钮，或
    - Agent / 用户直接调用 `POST /reclassify`（不传 action_type 则 AI 重新分类）
 
-### KB-aware 方向提取（v4 新增）
-
-v4 引入知识库感知能力，解决「每次发芽都从零开始」的问题：
-
-1. **C1 KB 检索**：`_extract` 端点在提取方向后、分类前，调用一次 `search_notes`（用笔记标题 + 前3个方向关键词拼接检索），返回最多 5 条相关笔记
-2. **C2 KB 关系标注**：每条方向标注与知识库的关系：
-   - `new`（新增）：全新话题，知识库中无相关笔记
-   - `update`（更新）：与已有笔记内容高度相关，执行时应更新该笔记
-   - `deepen`（深化）：在已有笔记涉及的主题上进一步深入
-   - 规则预分类的方向用标题简单匹配；AI 分类的方向由 LLM 根据 KB 上下文判断
-3. **C3 UI 展示**：pipeline 详情页方向列表中，每条方向显示 🔄更新/🔬深化 徽章 + 关联笔记标题
-4. **C4 exec_prompt 注入**：标记为 update/deepen 的方向，其 exec_prompt 追加 KB 关联指引，要求 Agent 执行时先读取关联笔记再在其基础上更新/深化
-5. **向后兼容**：KB 检索失败或返回空时，自动降级为全 `new`，不影响现有流程
-
 ## Endpoints
 
 ### UI 端点
@@ -120,8 +106,6 @@ v4 引入知识库感知能力，解决「每次发芽都从零开始」的问�
 
 - `POST /link-results` — 成果回链：更新原笔记 + 新建汇总笔记
   - params: `source_id` 或 `note_id`
-
-- `GET /status` — 返回 SproutForge 运行状态（健康度、各状态方向计数、卡住/失败告警、最近活动），供 Agent 聚合查询。无需参数。
 
 ## Agent 自动执行协议（关键）
 
@@ -204,8 +188,7 @@ params: source_id=<source_id>
 
 独立 SQLite（`data/db/app.sqlite`），2 张表：
 
-- **`sprout_actions`**: 发芽方向/行动项（id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, exec_prompt, result_ref, result_summary, created_at, updated_at, kb_relation, kb_note_id, kb_note_title）
-  - v4 新增：`kb_relation`（new/update/deepen）、`kb_note_id`、`kb_note_title`
+- **`sprout_actions`**: 发芽方向/行动项（id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, exec_prompt, result_ref, result_summary, created_at, updated_at）
 - **`pipelines`**: 执行流水线（id, source_id, note_id, total_actions, completed_actions, status, summary_note_id, meta, created_at, updated_at）
 
 ## 运行时

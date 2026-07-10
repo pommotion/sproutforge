@@ -123,13 +123,6 @@
         "source_id": {"type": "string", "required": false},
         "note_id": {"type": "string", "required": false}
       }
-    },
-    {
-      "method": "GET",
-      "path": "/status",
-      "type": "data",
-      "description": "Return sproutforge runtime status (health, action counts, stuck/failed alerts, recent activity) for Agent aggregation.",
-      "params": {}
     }
   ]
 }

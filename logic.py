@@ -1,4 +1,4 @@
-"""SproutForge - 发芽笔记的下游执行引擎.
+"""SproutForge — 发芽笔记的下游执行引擎.
 
 Workflow: 发芽笔记 → 方向提取 → AI 分类 → 执行计划 → 成果回链
 """
@@ -81,12 +81,6 @@ def _init_db(db):
         db.exec("ALTER TABLE sprout_actions ADD COLUMN reason TEXT DEFAULT ''")
     except Exception:
         pass
-    # Migration: add KB relation columns (v4 - KB-aware sprouting)
-    for col, default in [('kb_relation', "'new'"), ('kb_note_id', "''"), ('kb_note_title', "''")]:
-        try:
-            db.exec(f"ALTER TABLE sprout_actions ADD COLUMN {col} TEXT DEFAULT {default}")
-        except Exception:
-            pass
     db.exec('''
         CREATE TABLE IF NOT EXISTS pipelines (
             id TEXT PRIMARY KEY,
@@ -158,102 +152,6 @@ def _get_source_meta(source_id):
 
 
 # ---------------------------------------------------------------------------
-# KB context retrieval (C1: KB-aware sprouting)
-# ---------------------------------------------------------------------------
-def _search_kb_context(note_title, directions, limit=5, exclude_note_id=''):
-    """Search knowledge base for related notes. Returns list of {id, title} or [].
-    
-    One search call for all directions (not per-direction) to keep latency ≤ 3s.
-    Gracefully returns [] on any failure (backward compatible).
-    exclude_note_id: the source note being extracted - excluded from results to avoid self-matching.
-    """
-    try:
-        keywords = (note_title or '').strip()
-        for d in directions[:3]:
-            first_line = d.split('\n')[0].strip()[:30]
-            if first_line:
-                keywords += ' ' + first_line
-        keywords = keywords.strip()
-        if not keywords:
-            return []
-        resp = syscall('search_notes', {'query': keywords, 'limit': limit})
-        data = resp.get('data', resp) if isinstance(resp, dict) else {}
-        results = data.get('results', data) if isinstance(data, dict) else data
-        if not isinstance(results, list):
-            return []
-        related = []
-        for r in results:
-            rid = r.get('id', r.get('noteId', ''))
-            rtitle = r.get('title', '')
-            rpreview = r.get('preview', r.get('snippet', ''))[:200] if r.get('preview', r.get('snippet', '')) else ''
-            if rid and rtitle and rid != exclude_note_id:
-                related.append({'id': rid, 'title': rtitle, 'preview': rpreview})
-        LOGGER.info('kb.search', f'found {len(related)} related notes', {'keywords': keywords[:80]})
-        return related
-    except Exception as e:
-        LOGGER.warn('kb.search', f'KB search failed, degrading to no-KB mode: {e}', {})
-        return []
-
-
-def _extract_cn_keywords(text):
-    """Extract Chinese 2-grams and latin words from text for fuzzy matching.
-    
-    CJK 2-gram sliding window catches semantic overlap even without word segmentation.
-    E.g. '视频生成' -> {'视频', '频生', '生成'}
-    """
-    text_lower = text.lower()
-    # Latin words (≥3 chars)
-    keywords = set(re.findall(r'[a-z]{3,}', text_lower))
-    # CJK 2-grams: slide over continuous CJK runs
-    for cjk_run in re.findall(r'[\u4e00-\u9fff]+', text_lower):
-        for i in range(len(cjk_run) - 1):
-            keywords.add(cjk_run[i:i+2])
-    return keywords
-
-
-def _match_direction_to_kb(direction_text, kb_notes):
-    """Match a direction to KB notes using keyword overlap on title + preview.
-    
-    direction_text: can be full direction description (not just title) for richer keywords.
-    Returns (relation, note_id, note_title) or ('new', '', '').
-    - 'update': exact title containment or ≥3 shared title keywords
-    - 'deepen': ≥2 shared keywords from title, or ≥3 from preview
-    """
-    if not kb_notes:
-        return 'new', '', ''
-    dt_keywords = _extract_cn_keywords(direction_text)
-    if not dt_keywords:
-        return 'new', '', ''
-    best_match = None
-    best_score = 0
-    for kn in kb_notes:
-        kt = kn.get('title', '')
-        kt_lower = kt.lower()
-        # Exact containment check
-        if len(kt_lower) >= 4 and (kt_lower in direction_text.lower() or direction_text.lower() in kt_lower):
-            return 'update', kn['id'], kn['title']
-        # Keyword overlap on KB note title (higher weight)
-        kt_keywords = _extract_cn_keywords(kt)
-        shared_title = dt_keywords & kt_keywords
-        if len(shared_title) >= 3:
-            return 'update', kn['id'], kn['title']
-        if len(shared_title) >= 2 and len(shared_title) > best_score:
-            best_score = len(shared_title)
-            best_match = kn
-        # Keyword overlap on preview (lower weight)
-        kp = kn.get('preview', '')
-        if kp:
-            kp_keywords = _extract_cn_keywords(kp)
-            shared_preview = dt_keywords & kp_keywords
-            if len(shared_preview) >= 4 and len(shared_preview) > best_score:
-                best_score = len(shared_preview)
-                best_match = kn
-    if best_match:
-        return 'deepen', best_match['id'], best_match['title']
-    return 'new', '', ''
-
-
-# ---------------------------------------------------------------------------
 # Direction extraction
 # ---------------------------------------------------------------------------
 _SPROUT_SECTION_RE = re.compile(r'##\s*🌿\s*发芽扩展', re.IGNORECASE)
@@ -263,7 +161,7 @@ def _extract_directions_from_note(note_content):
     """Parse '## 🌿 发芽扩展' section and split into individual directions.
 
     Handles two formats:
-    1. content-router sprout notes: '### 方向 N:title\ndescription'
+    1. content-router sprout notes: '### 方向 N：title\ndescription'
     2. Generic numbered/bulleted lists: '1. ...' or '- ...' or '• ...'
     """
     match = _SPROUT_SECTION_RE.search(note_content)
@@ -279,12 +177,12 @@ def _extract_directions_from_note(note_content):
 
     directions = []
     # Split on: ### 方向 N headers, or numbered (1-99)/bulleted list items
-    for block in re.split(r'\n(?=###\s*方向\s*\d{1,2}[::]|\d{1,2}[\.\)\u3001\]]\s+|^[\-•\*]\s+)', section_text, flags=re.MULTILINE):
+    for block in re.split(r'\n(?=###\s*方向\s*\d{1,2}[：:]|\d{1,2}[\.\)\u3001\]]\s+|^[\-•\*]\s+)', section_text, flags=re.MULTILINE):
         block = block.strip()
         if not block:
             continue
-        # Remove leading ### 方向 N: prefix, then number/bullet markers
-        clean = re.sub(r'^(###\s*方向\s*\d{1,2}[::]\s*)?(\d{1,2}[\.\)\u3001\]]?|[\-•\*]\s*)*', '', block).strip()
+        # Remove leading ### 方向 N： prefix, then number/bullet markers
+        clean = re.sub(r'^(###\s*方向\s*\d{1,2}[：:]\s*)?(\d{1,2}[\.\)\u3001\]]?|[\-•\*]\s*)*', '', block).strip()
         if clean and len(clean) > 5:
             directions.append(clean)
     return directions
@@ -331,7 +229,7 @@ def _ai_extract_directions(note_content, note_title=''):
     LOGGER.warn('ai_extract.attempt1', f'full-text extraction failed: {err}', {})
 
     # --- Attempt 2: simplified retry with shorter content ---
-    simplified_prompt = f'以下是一篇笔记的标题和内容。请提取 3-8 个可执行的行动方向。\n\n标题:{note_title or "(无标题)"}\n\n内容:\n{note_content[:4000]}\n\n请只输出 JSON 数组,每个元素是一个字符串。'
+    simplified_prompt = f'以下是一篇笔记的标题和内容。请提取 3-8 个可执行的行动方向。\n\n标题：{note_title or "(无标题)"}\n\n内容：\n{note_content[:4000]}\n\n请只输出 JSON 数组，每个元素是一个字符串。'
     simplified_system = 'You are a helpful assistant. Extract actionable directions from notes. Output ONLY a JSON array of strings.'
     dirs, err2 = _ai_extract_single(simplified_prompt, simplified_system)
     if dirs:
@@ -347,7 +245,7 @@ def _ai_extract_directions(note_content, note_title=''):
         if len(section) < 20:
             continue
         dirs_s, _ = _ai_extract_single(
-            f'从这段内容中提取可执行方向(1-3个):\n\n{section[:2000]}\n\n输出 JSON 数组。',
+            f'从这段内容中提取可执行方向（1-3个）：\n\n{section[:2000]}\n\n输出 JSON 数组。',
             simplified_system,
         )
         if dirs_s:
@@ -424,7 +322,7 @@ def _pre_classify(title, description):
     full_text = f'{title} {description}'
     full_lower = full_text.lower()
 
-    # Determine action_type - only match against title to avoid false positives
+    # Determine action_type — only match against title to avoid false positives
     action_type = None
     for atype, keywords in _CLASSIFY_RULES:
         for kw in keywords:
@@ -442,7 +340,7 @@ def _pre_classify(title, description):
         if action_type:
             break
 
-    # Determine priority - match against full text
+    # Determine priority — match against full text
     priority = 'medium'
     if any(kw in full_text for kw in _PRIORITY_RULES_HIGH):
         priority = 'high'
@@ -462,10 +360,6 @@ For each direction, output JSON with these fields:
 - priority: "high", "medium", or "low" based on impact and urgency
 - title: a concise action title (5-20 chars Chinese / 5-40 chars English)
 - reason: one sentence explaining why this classification
-- kb_relation: one of "new" (brand new topic, no existing note), "update" (updates/extends an existing note), "deepen" (deepens a topic already touched on). Default "new" if unsure.
-- kb_note_id: the note_id from the KB context that this direction relates to, or empty string if "new"
-
-If KB context is provided, use it to determine kb_relation and kb_note_id. If no KB context is provided, set kb_relation="new" and kb_note_id="".
 
 Output ONLY a JSON array, no markdown fences.'''
 
@@ -474,8 +368,6 @@ _CLASSIFY_USER = '''Here are {count} sprout directions from a sprout note:
 {directions}
 
 Source context: {context}
-
-{kb_context}
 
 Classify each direction. Output a JSON array with {count} objects.'''
 
@@ -491,25 +383,15 @@ Example classifications:
 '''
 
 
-def _ai_classify(directions, note_title='', kb_notes=None):
-    """Call AI to classify directions. Returns list of dicts.
-    kb_notes: list of {id, title} from KB search, or None/[] for no KB context.
-    """
+def _ai_classify(directions, note_title=''):
+    """Call AI to classify directions. Returns list of dicts."""
     if not directions:
         return []
     numbered = '\n'.join(f'{i+1}. {d}' for i, d in enumerate(directions))
-    # Build KB context section
-    if kb_notes:
-        kb_lines = 'Knowledge base context - existing notes that may relate to these directions:'
-        for kn in kb_notes:
-            kb_lines += f'\n  - note_id: {kn["id"]}, title: "{kn["title"]}"'
-    else:
-        kb_lines = 'No KB context available.'
     prompt = _CLASSIFY_USER.format(
         count=len(directions),
         directions=numbered,
         context=note_title or '(no title)',
-        kb_context=kb_lines,
     )
     try:
         result = run_prompt(
@@ -536,11 +418,10 @@ def _ai_classify(directions, note_title='', kb_notes=None):
         return []
 
 
-def _classify_directions(directions, note_title='', kb_notes=None):
+def _classify_directions(directions, note_title=''):
     """Two-layer classification: rule pre-filter + AI fallback for unmatched.
-    kb_notes: optional KB context for AI classification and relation labeling.
-    Returns list of dicts with keys: action_type, action_subtype, priority, title, reason,
-    and optionally kb_relation, kb_note_id, kb_note_title.
+
+    Returns list of dicts with keys: action_type, action_subtype, priority, title, reason.
     Length always == len(directions).
     """
     if not directions:
@@ -555,17 +436,12 @@ def _classify_directions(directions, note_title='', kb_notes=None):
         first_line = direction.split('\n')[0].strip()
         atype, priority = _pre_classify(first_line, direction)
         if atype:
-            # Rule-matched directions: use full direction text for richer KB matching
-            kb_rel, kb_nid, kb_ntitle = _match_direction_to_kb(direction, kb_notes or [])
             results[i] = {
                 'action_type': atype,
                 'action_subtype': '',
                 'priority': priority,
                 'title': first_line[:40] if first_line else direction[:20],
                 'reason': f'规则匹配: keyword hit',
-                'kb_relation': kb_rel,
-                'kb_note_id': kb_nid,
-                'kb_note_title': kb_ntitle,
             }
         else:
             ai_needed_indices.append(i)
@@ -573,35 +449,21 @@ def _classify_directions(directions, note_title='', kb_notes=None):
 
     LOGGER.info('classify.pre', f'rule classified {len(directions) - len(ai_needed_indices)}/{len(directions)}, {len(ai_needed_indices)} need AI', {})
 
-    # Layer 2: AI classification only for unmatched directions (with KB context)
+    # Layer 2: AI classification only for unmatched directions
     if ai_needed_directions:
-        ai_results = _ai_classify(ai_needed_directions, note_title, kb_notes)
+        ai_results = _ai_classify(ai_needed_directions, note_title)
         for j, idx in enumerate(ai_needed_indices):
             if j < len(ai_results):
-                r = ai_results[j]
-                # Ensure kb_relation fields exist with defaults
-                r.setdefault('kb_relation', 'new')
-                r.setdefault('kb_note_id', '')
-                r.setdefault('kb_note_title', '')
-                # Validate kb_note_id if kb_relation is update/deepen
-                if r.get('kb_relation') in ('update', 'deepen') and not r.get('kb_note_id') and kb_notes:
-                    # AI said update/deepen but didn't specify which note - try matching with full direction
-                    kb_rel, kb_nid, kb_ntitle = _match_direction_to_kb(directions[idx], kb_notes)
-                    r['kb_note_id'] = kb_nid
-                    r['kb_note_title'] = kb_ntitle
-                results[idx] = r
+                results[idx] = ai_results[j]
             else:
-                # AI didn't return enough - fallback to exec, but still try KB matching
-                kb_rel, kb_nid, kb_ntitle = _match_direction_to_kb(directions[idx], kb_notes or [])
+                # AI didn't return enough — fallback to exec
+                first_line = directions[idx].split('\n')[0].strip()
                 results[idx] = {
                     'action_type': 'exec',
                     'action_subtype': '',
                     'priority': 'medium',
                     'title': first_line[:40],
                     'reason': 'AI fallback to exec',
-                    'kb_relation': kb_rel,
-                    'kb_note_id': kb_nid,
-                    'kb_note_title': kb_ntitle,
                 }
 
     return results
@@ -617,17 +479,17 @@ def _build_exec_prompt(action_type, action_subtype, title, description, context)
         desc = description  # safety fallback
 
     if action_type == 'research':
-        return f'使用 /deep-research 对以下主题进行深度研究:\n\n主题:{title}\n方向:{desc}\n\n背景:{context}'
+        return f'使用 /deep-research 对以下主题进行深度研究：\n\n主题：{title}\n方向：{desc}\n\n背景：{context}'
     elif action_type == 'survey':
-        return f'使用 /deep-survey 对以下主题做多源调研:\n\n主题:{title}\n角度:{desc}\n\n背景:{context}'
+        return f'使用 /deep-survey 对以下主题做多源调研：\n\n主题：{title}\n角度：{desc}\n\n背景：{context}'
     elif action_type == 'prd':
-        return f'使用 /prd-writer 为以下需求编写 PRD 文档:\n\n需求:{title}\n描述:{desc}\n\n背景:{context}'
+        return f'使用 /prd-writer 为以下需求编写 PRD 文档：\n\n需求：{title}\n描述：{desc}\n\n背景：{context}'
     elif action_type == 'goal':
-        return f'使用 /goalpro 为以下任务创建 Goal Contract:\n\n任务:{title}\n描述:{desc}\n\n背景:{context}'
+        return f'使用 /goalpro 为以下任务创建 Goal Contract：\n\n任务：{title}\n描述：{desc}\n\n背景：{context}'
     elif action_type == 'exec':
-        return f'直接执行以下任务:\n\n{title}\n{desc}\n\n背景:{context}'
+        return f'直接执行以下任务：\n\n{title}\n{desc}\n\n背景：{context}'
     else:
-        return f'归档参考:{title} - {desc}'
+        return f'归档参考：{title} — {desc}'
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +603,7 @@ def _status_summary(actions):
         parts.append(f"⏭️{counts['skipped']}")
     if counts['failed']:
         parts.append(f"❌{counts['failed']}")
-    return ' '.join(parts) if parts else '-'
+    return ' '.join(parts) if parts else '—'
 
 
 def _format_direction_card(action):
@@ -758,19 +620,10 @@ def _format_direction_card(action):
 
     # Build description with classification reason
     reason = action.get('reason', '')
-    # C3: KB relation badge
-    kb_rel = action.get('kb_relation', 'new')
-    kb_badge = ''
-    if kb_rel == 'update':
-        kb_badge = ' 🔄更新'
-    elif kb_rel == 'deepen':
-        kb_badge = ' 🔬深化'
-    if kb_rel in ('update', 'deepen') and action.get('kb_note_title'):
-        kb_badge += f'《{action["kb_note_title"][:20]}》'
     if reason:
-        description_text = f'{type_label}{kb_badge} · {desc}\n💡 分类依据:{reason}'
+        description_text = f'{type_label} · {desc}\n💡 分类依据：{reason}'
     else:
-        description_text = f'{type_label}{kb_badge} · {desc}'
+        description_text = f'{type_label} · {desc}'
 
     item = {
         'title': f'{pri_emoji} {title}',
@@ -791,14 +644,14 @@ def _format_direction_card(action):
                 'method': 'POST',
                 'path': '/execute',
                 'params': {'action_id': aid},
-                'prompt': f'执行方向:{title}',
+                'prompt': f'执行方向：{title}',
             }
         })
         actions.append({
             'label': '重分类',
             'style': 'default',
             'action': {
-                'prompt': f'重新分类方向「{title}」(调用 POST /reclassify,params: action_id={aid})--如果不指定类型,AI 会自动重新分类。可选类型:research(深度研究) / survey(多源调研) / prd(产品设计) / goal(目标对齐) / exec(直接执行) / archive(归档参考)',
+                'prompt': f'重新分类方向「{title}」（调用 POST /reclassify，params: action_id={aid}）——如果不指定类型，AI 会自动重新分类。可选类型：research(深度研究) / survey(多源调研) / prd(产品设计) / goal(目标对齐) / exec(直接执行) / archive(归档参考)',
             }
         })
     if action.get('status') == 'completed' and action.get('result_ref'):
@@ -810,7 +663,7 @@ def _format_direction_card(action):
                 'open_target': ref,
             })
         else:
-            item['description'] += f'\n📋 成果:{action.get("result_summary", ref)}'
+            item['description'] += f'\n📋 成果：{action.get("result_summary", ref)}'
 
     if actions:
         item['actions'] = actions
@@ -826,25 +679,25 @@ def _home(params):
     return {
         'components': [
             {'kind': 'text', 'text': '🌱 SproutForge 发芽锻造器', 'heading': 2},
-            {'kind': 'text', 'text': '从素材到执行的一体化入口。粘贴任意链接自动抓取生成发芽笔记,或直接 @ 任意笔记提取方向并智能分类。'},
+            {'kind': 'text', 'text': '从素材到执行的一体化入口。粘贴任意链接自动抓取生成发芽笔记，或直接 @ 任意笔记提取方向并智能分类。'},
 
-            # === URL 入口:链接 → content-router 抓取 → sproutforge 提取 ===
+            # === URL 入口：链接 → content-router 抓取 → sproutforge 提取 ===
             {'kind': 'divider'},
             {'kind': 'text', 'text': '🔗 从链接开始', 'heading': 4},
-            {'kind': 'input', 'key': 'url', 'label': '素材链接', 'placeholder': '粘贴任意 URL(文章/视频/帖子)'},
+            {'kind': 'input', 'key': 'url', 'label': '素材链接', 'placeholder': '粘贴任意 URL（文章/视频/帖子）'},
             {
                 'kind': 'button',
                 'label': '🚀 抓取 + 提取方向',
                 'style': 'primary',
                 'action': {
-                    'promptTemplate': '请处理这个素材链接并提取发芽方向。\n\n步骤:\n1. 调用 content-router aApp 的 POST /process 接口,参数 url={url},完成抓取和发芽笔记生成\n2. 从返回结果中获取 note_id\n3. 调用 sproutforge aApp 的 POST /extract 接口,参数 note_id=<上一步获取的note_id>\n4. 展示提取到的方向列表',
+                    'promptTemplate': '请处理这个素材链接并提取发芽方向。\n\n步骤：\n1. 调用 content-router aApp 的 POST /process 接口，参数 url={url}，完成抓取和发芽笔记生成\n2. 从返回结果中获取 note_id\n3. 调用 sproutforge aApp 的 POST /extract 接口，参数 note_id=<上一步获取的note_id>\n4. 展示提取到的方向列表',
                 }
             },
 
-            # === 笔记入口:@ 任意笔记,无需知道 ID ===
+            # === 笔记入口：@ 任意笔记，无需知道 ID ===
             {'kind': 'divider'},
             {'kind': 'text', 'text': '📝 从笔记开始', 'heading': 4},
-            {'kind': 'text', 'text': '在对话中 **@ 任意笔记**(发芽笔记、普通笔记、文章摘要等均可),然后说「提取方向」即可。\n\n支持任何类型的笔记--有 🌿 发芽扩展章节的优先解析,没有的会 AI 全文提取。'},
+            {'kind': 'text', 'text': '在对话中 **@ 任意笔记**（发芽笔记、普通笔记、文章摘要等均可），然后说「提取方向」即可。\n\n支持任何类型的笔记——有 🌿 发芽扩展章节的优先解析，没有的会 AI 全文提取。'},
 
             # === 功能入口 ===
             {'kind': 'divider'},
@@ -913,19 +766,15 @@ def _extract(params):
         # Extract directions from 🌿 发芽扩展 section
         raw_directions = _extract_directions_from_note(note_content)
         if not raw_directions:
-            # Fallback: no 🌿 section found - use AI to extract directions from full note
+            # Fallback: no 🌿 section found — use AI to extract directions from full note
             LOGGER.info('extract.fallback', 'no sprout section, trying AI full-text extraction', {'note_id': note_id})
             raw_directions, ai_error = _ai_extract_directions(note_content, note_title or '')
             if not raw_directions:
-                return {'error': 'no_directions', 'message': f'未找到「🌿 发芽扩展」章节,AI 也无法从笔记内容中提取有效方向。详细原因:{ai_error}'}
+                return {'error': 'no_directions', 'message': f'未找到「🌿 发芽扩展」章节，AI 也无法从笔记内容中提取有效方向。详细原因：{ai_error}'}
 
         LOGGER.info('extract.directions', f'extracted {len(raw_directions)} directions', {'note_id': note_id})
 
-        # --- C1: KB context retrieval (one search for all directions) ---
-        kb_notes = _search_kb_context(note_title or (source_meta.get('title', '') if source_meta else ''), raw_directions, exclude_note_id=note_id)
-        LOGGER.info('extract.kb', f'KB context: {len(kb_notes)} related notes found', {})
-
-        # Check for existing actions (avoid duplicate extraction) - check both note_id and source_id
+        # Check for existing actions (avoid duplicate extraction) — check both note_id and source_id
         existing = []
         if note_id:
             existing = db.query('SELECT direction_index FROM sprout_actions WHERE note_id = :nid', {'nid': note_id})
@@ -933,18 +782,18 @@ def _extract(params):
             existing = db.query('SELECT direction_index FROM sprout_actions WHERE source_id = :sid', {'sid': source_id})
         if existing and len(existing) >= len(raw_directions):
             return {
-                'message': f'该笔记已提取过 {len(existing)} 个方向,跳过重复提取',
+                'message': f'该笔记已提取过 {len(existing)} 个方向，跳过重复提取',
                 'pipeline_source_id': source_id or note_id,
                 'direction_count': len(existing),
             }
 
-        # AI classification (with KB context for relation labeling)
+        # AI classification
         if meta is None:
             source_meta = _get_source_meta(source_id) if source_id else {}
         else:
             source_meta = meta
         context = note_title or source_meta.get('title', '')
-        classifications = _classify_directions(raw_directions, context, kb_notes)
+        classifications = _classify_directions(raw_directions, context)
 
         # Create pipeline
         pipeline = _get_or_create_pipeline(db, source_id, note_id)
@@ -986,24 +835,11 @@ def _extract(params):
 
             exec_prompt = _build_exec_prompt(action_type, cls.get('action_subtype', ''), title, description, context_str)
 
-            # C4: Inject KB context into exec_prompt if direction relates to existing note
-            kb_rel = cls.get('kb_relation', 'new')
-            kb_nid = cls.get('kb_note_id', '')
-            kb_ntitle = cls.get('kb_note_title', '')
-            # Backfill kb_note_title from kb_notes if AI forgot to include it
-            if kb_nid and not kb_ntitle and kb_notes:
-                for kn in kb_notes:
-                    if kn['id'] == kb_nid:
-                        kb_ntitle = kn['title']
-                        break
-            if kb_rel in ('update', 'deepen') and kb_nid:
-                exec_prompt += f'\n\n📚 知识库关联:本方向与已有笔记「{kb_ntitle}」相关({kb_rel}),执行时请先读取该笔记(noteId: {kb_nid}),在其基础上{ "更新" if kb_rel == "update" else "深化扩展" },而非从零开始。'
-
             db.exec(
-                'INSERT INTO sprout_actions (id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, reason, exec_prompt, result_ref, result_summary, created_at, updated_at, kb_relation, kb_note_id, kb_note_title) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [aid, source_id, note_id, i + 1, title, description, action_type, cls.get('action_subtype', ''), priority, 'pending', cls.get('reason', ''), exec_prompt, '', '', now, now, kb_rel, kb_nid, kb_ntitle]
+                'INSERT INTO sprout_actions (id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, reason, exec_prompt, result_ref, result_summary, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [aid, source_id, note_id, i + 1, title, description, action_type, cls.get('action_subtype', ''), priority, 'pending', cls.get('reason', ''), exec_prompt, '', '', now, now]
             )
-            created.append({'id': aid, 'direction_index': i + 1, 'title': title, 'action_type': action_type, 'priority': priority, 'reason': cls.get('reason', ''), 'kb_relation': kb_rel, 'kb_note_id': kb_nid, 'kb_note_title': kb_ntitle})
+            created.append({'id': aid, 'direction_index': i + 1, 'title': title, 'action_type': action_type, 'priority': priority, 'reason': cls.get('reason', '')})
 
         _update_pipeline_progress(db, source_id or note_id)
 
@@ -1043,7 +879,7 @@ def _pipeline_detail(params):
             {'kind': 'text', 'text': f'**{note_title or source_id}**'},
         ]
         if meta_source and meta_source.get('url'):
-            components.append({'kind': 'text', 'text': f'📎 来源:{meta_source.get("platform", "")} - {meta_source["url"]}'})
+            components.append({'kind': 'text', 'text': f'📎 来源：{meta_source.get("platform", "")} — {meta_source["url"]}'})
         # Visual progress + type/status distribution
         type_dist = _type_distribution_bar(actions)
         status_sum = _status_summary(actions)
@@ -1078,7 +914,7 @@ def _pipeline_detail(params):
                     'method': 'POST',
                     'path': '/link-results',
                     'params': {'source_id': source_id},
-                    'prompt': '成果回链:更新原笔记 + 新建汇总笔记',
+                    'prompt': '成果回链：更新原笔记 + 新建汇总笔记',
                 }
             })
 
@@ -1127,7 +963,7 @@ def _dashboard(params):
                     'action': {
                         'method': 'GET',
                         'path': f'/pipeline/{p["source_id"] or p["note_id"]}',
-                        'prompt': f'查看流水线:{title}',
+                        'prompt': f'查看流水线：{title}',
                         'params': {},
                     }
                 }]
@@ -1171,7 +1007,7 @@ def _history(params):
                     'action': {
                         'method': 'GET',
                         'path': f'/pipeline/{p["source_id"] or p["note_id"]}',
-                        'prompt': f'查看流水线:{title}',
+                        'prompt': f'查看流水线：{title}',
                         'params': {},
                     }
                 }]
@@ -1187,8 +1023,8 @@ def _history(params):
 def _stats(params):
     """知识→行动转化率仪表盘。
 
-    展示:全局漏斗、类型分布、沉睡方向(提取超过3天仍未执行)。
-    概念升级:让用户看到「哪些灵感被浪费了」。"""
+    展示：全局漏斗、类型分布、沉睡方向（提取超过3天仍未执行）。
+    概念升级：让用户看到「哪些灵感被浪费了」。"""
     db = _open_db()
     try:
         # --- 全局漏斗 ---
@@ -1205,7 +1041,7 @@ def _stats(params):
             'FROM sprout_actions GROUP BY action_type ORDER BY c DESC'
         )
 
-        # --- 沉睡方向:提取超过3天仍 pending 的 ---
+        # --- 沉睡方向：提取超过3天仍 pending 的 ---
         now_ts = _now()
         cutoff = now_ts - 3 * 86400
         dormant = db.query(
@@ -1225,13 +1061,13 @@ def _stats(params):
         start_rate = _safe_pct(started, total_actions)
 
         funnel_text = (
-            f'📝 笔记提取:{total_pipelines} 篇 → '
-            f'🌱 方向:{total_actions} 个\n'
-            f'🚀 已启动:{started}/{total_actions} ({start_rate}%) '
+            f'📝 笔记提取：{total_pipelines} 篇 → '
+            f'🌱 方向：{total_actions} 个\n'
+            f'🚀 已启动：{started}/{total_actions} ({start_rate}%) '
             f'{_progress_bar(started, total_actions)}\n'
-            f'✅ 已完成:{completed}/{total_actions} ({funnel_rate}%) '
+            f'✅ 已完成：{completed}/{total_actions} ({funnel_rate}%) '
             f'{_progress_bar(completed, total_actions)}\n'
-            f'⏭️ 已跳过:{skipped} 个'
+            f'⏭️ 已跳过：{skipped} 个'
         )
         components.append({'kind': 'text', 'text': '🎯 转化漏斗', 'heading': 4})
         components.append({'kind': 'text', 'text': funnel_text})
@@ -1239,7 +1075,7 @@ def _stats(params):
         # --- 漏斗流失分析 ---
         pending_count = total_actions - started
         if pending_count > 0:
-            components.append({'kind': 'text', 'text': f'⚠️ 有 {pending_count} 个方向提取后从未启动--这些是「被浪费的灵感」'})
+            components.append({'kind': 'text', 'text': f'⚠️ 有 {pending_count} 个方向提取后从未启动——这些是「被浪费的灵感」'})
 
         # --- 类型分布 + 各类型完成率 ---
         if type_rows:
@@ -1252,13 +1088,13 @@ def _stats(params):
                 done = r['done'] or 0
                 badge = _type_badge(atype)
                 pct = _safe_pct(done, cnt)
-                type_lines.append(f'{badge} {atype}:{cnt} 个 → ✅{done} ({pct}%)')
+                type_lines.append(f'{badge} {atype}：{cnt} 个 → ✅{done} ({pct}%)')
             components.append({'kind': 'text', 'text': '\n'.join(type_lines)})
 
         # --- 沉睡方向 ---
         if dormant:
             components.append({'kind': 'divider'})
-            components.append({'kind': 'text', 'text': f'💤 沉睡方向(提取超过3天未执行)', 'heading': 4})
+            components.append({'kind': 'text', 'text': f'💤 沉睡方向（提取超过3天未执行）', 'heading': 4})
             dormant_items = []
             for a in dormant:
                 days_ago = int((now_ts - a['created_at']) / 86400)
@@ -1266,7 +1102,7 @@ def _stats(params):
                 atype_badge = _type_badge(a.get('action_type', ''))
                 dormant_items.append({
                     'title': f'{atype_badge} {title}',
-                    'description': f'⏰ 提取于 {days_ago} 天前 · 状态:待审',
+                    'description': f'⏰ 提取于 {days_ago} 天前 · 状态：待审',
                     'badge': f'{days_ago}d',
                     'badgeStyle': 'danger',
                     'actions': [{
@@ -1276,7 +1112,7 @@ def _stats(params):
                             'method': 'POST',
                             'path': '/execute',
                             'params': {'action_id': a['id']},
-                            'prompt': f'执行沉睡方向:{title}',
+                            'prompt': f'执行沉睡方向：{title}',
                             'aapp_id': 'sproutforge',
                         }
                     }]
@@ -1286,15 +1122,15 @@ def _stats(params):
         # --- 总结洞察 ---
         components.append({'kind': 'divider'})
         if total_actions == 0:
-            insight = '还没有任何方向被提取。从一篇笔记开始吧!'
+            insight = '还没有任何方向被提取。从一篇笔记开始吧！'
         elif funnel_rate >= 80:
-            insight = f'🔥 转化率 {funnel_rate}%--执行力很强!'
+            insight = f'🔥 转化率 {funnel_rate}%——执行力很强！'
         elif funnel_rate >= 50:
-            insight = f'💪 转化率 {funnel_rate}%--还不错,继续推进剩余方向。'
+            insight = f'💪 转化率 {funnel_rate}%——还不错，继续推进剩余方向。'
         elif funnel_rate >= 20:
-            insight = f'🤔 转化率 {funnel_rate}%--有灵感但执行力跟不上,先完成最重要的。'
+            insight = f'🤔 转化率 {funnel_rate}%——有灵感但执行力跟不上，先完成最重要的。'
         else:
-            insight = f'❄️ 转化率仅 {funnel_rate}%--大量灵感在沉睡。挑一个最重要的开始吧!'
+            insight = f'❄️ 转化率仅 {funnel_rate}%——大量灵感在沉睡。挑一个最重要的开始吧！'
         components.append({'kind': 'text', 'text': insight})
 
         # --- 底部导航 ---
@@ -1332,24 +1168,17 @@ def _reclassify(params):
         action = rows[0]
 
         if not new_type:
-            # AI reclassify (with KB context if available)
-            kb_notes = _search_kb_context(action.get('title', ''), [action['description']])
-            classifications = _classify_directions([action['description']], action.get('title', ''), kb_notes)
+            # AI reclassify
+            classifications = _classify_directions([action['description']], action.get('title', ''))
             if classifications:
                 new_type = classifications[0].get('action_type', 'exec')
                 new_subtype = classifications[0].get('action_subtype', '')
                 new_priority = classifications[0].get('priority', 'medium')
-                new_kb_rel = classifications[0].get('kb_relation', 'new')
-                new_kb_nid = classifications[0].get('kb_note_id', '')
-                new_kb_ntitle = classifications[0].get('kb_note_title', '')
             else:
                 return {'error': 'classify_failed'}
         else:
             new_subtype = params.get('action_subtype', '')
             new_priority = params.get('priority', action.get('priority'))
-            new_kb_rel = action.get('kb_relation', 'new')
-            new_kb_nid = action.get('kb_note_id', '')
-            new_kb_ntitle = action.get('kb_note_title', '')
 
         now = _now()
         # Get note title from pipeline meta for proper context (not direction title)
@@ -1359,15 +1188,12 @@ def _reclassify(params):
             p_meta = json.loads(p_rows[0].get('meta', '{}') or '{}')
             context = p_meta.get('note_title', '') or context
         exec_prompt = _build_exec_prompt(new_type, new_subtype, action['title'], action['description'], context)
-        # C4: Re-inject KB context on reclassify
-        if new_kb_rel in ('update', 'deepen') and new_kb_nid:
-            exec_prompt += f'\n\n📚 知识库关联:本方向与已有笔记「{new_kb_ntitle}」相关({new_kb_rel}),执行时请先读取该笔记(noteId: {new_kb_nid}),在其基础上{"更新" if new_kb_rel == "update" else "深化扩展"},而非从零开始。'
         db.exec(
-            'UPDATE sprout_actions SET action_type = ?, action_subtype = ?, priority = ?, exec_prompt = ?, kb_relation = ?, kb_note_id = ?, kb_note_title = ?, updated_at = ? WHERE id = ?',
-            [new_type, new_subtype, new_priority, exec_prompt, new_kb_rel, new_kb_nid, new_kb_ntitle, now, action_id]
+            'UPDATE sprout_actions SET action_type = ?, action_subtype = ?, priority = ?, exec_prompt = ?, updated_at = ? WHERE id = ?',
+            [new_type, new_subtype, new_priority, exec_prompt, now, action_id]
         )
         LOGGER.info('reclassify', f'action {action_id} reclassified to {new_type}', {})
-        return {'action_id': action_id, 'action_type': new_type, 'action_subtype': new_subtype, 'priority': new_priority, 'kb_relation': new_kb_rel, 'kb_note_id': new_kb_nid, 'kb_note_title': new_kb_ntitle}
+        return {'action_id': action_id, 'action_type': new_type, 'action_subtype': new_subtype, 'priority': new_priority}
     finally:
         db.close()
 
@@ -1432,7 +1258,7 @@ def _execute(params):
             'title': action['title'],
             'action_type': action['action_type'],
             'exec_prompt': action.get('exec_prompt', ''),
-            'message': f'开始执行「{action["title"]}」,Agent 将根据 exec_prompt 调用对应 skill。完成后请调用 /complete 回传成果。',
+            'message': f'开始执行「{action["title"]}」，Agent 将根据 exec_prompt 调用对应 skill。完成后请调用 /complete 回传成果。',
         }
     finally:
         db.close()
@@ -1468,7 +1294,7 @@ def _batch_execute(params):
             'source_id': source_id,
             'plan_count': len(plan),
             'plan': plan,
-            'message': f'已生成 {len(plan)} 个方向的执行计划。Agent 请按顺序执行,每个完成后调用 /complete 回传。',
+            'message': f'已生成 {len(plan)} 个方向的执行计划。Agent 请按顺序执行，每个完成后调用 /complete 回传。',
         }
     finally:
         db.close()
@@ -1477,11 +1303,11 @@ def _batch_execute(params):
 def _extract_note_id(ref):
     """从 result_ref 字符串中提取 note_id。
 
-    支持格式:
+    支持格式：
       - note://xxx
       - :remio-inlink[title]{#xxx}
       - 纯 note_id (20+ 字符的字母数字串)
-      - 文件路径(不提取 note_id,返回 None)
+      - 文件路径（不提取 note_id，返回 None）
     """
     if not ref:
         return ''
@@ -1493,7 +1319,7 @@ def _extract_note_id(ref):
     m = re.search(r'\{#([a-z0-9]+)\}', ref)
     if m:
         return m.group(1)
-    # 纯 ID(16+ 字符的字母数字串,适配 remio noteId 格式)
+    # 纯 ID（16+ 字符的字母数字串，适配 remio noteId 格式）
     m = re.match(r'^([a-z0-9]{16,})$', ref.strip())
     if m:
         return m.group(1)
@@ -1501,7 +1327,7 @@ def _extract_note_id(ref):
 
 
 def _add_to_sprout_collection(note_id, collection_name='SproutForge 产出'):
-    """把笔记归入 SproutForge collection,出错不抛异常。"""
+    """把笔记归入 SproutForge collection，出错不抛异常。"""
     if not note_id:
         return False
     try:
@@ -1537,7 +1363,7 @@ def _complete(params):
 
         LOGGER.info('complete', f'action {action_id} completed', {'result_ref': result_ref[:80]})
 
-        # ✅ 立即把成果笔记归入 collection,不要等 /link-results
+        # ✅ 立即把成果笔记归入 collection，不要等 /link-results
         result_note_id = _extract_note_id(result_ref)
         if result_note_id:
             _add_to_sprout_collection(result_note_id)
@@ -1549,7 +1375,7 @@ def _complete(params):
         if remaining and remaining[0]['cnt'] == 0:
             try:
                 from remio_sdk import send_chat_message
-                send_chat_message(f'✅ 流水线全部完成!所有方向已执行。可调用 /link-results 进行成果回链。source_id={source_id}')
+                send_chat_message(f'✅ 流水线全部完成！所有方向已执行。可调用 /link-results 进行成果回链。source_id={source_id}')
             except Exception:
                 pass
 
@@ -1639,20 +1465,20 @@ def _link_results(params):
 
         # Build summary note
         completed = [a for a in actions if a.get('status') == 'completed']
-        lines = [f'# 📋 SproutForge 汇总:{note_title or source_id}\n']
+        lines = [f'# 📋 SproutForge 汇总：{note_title or source_id}\n']
         if source_meta and source_meta.get('url'):
-            lines.append(f'📎 素材来源:{source_meta.get("platform", "")} - {source_meta["url"]}\n')
-        lines.append(f'共 {len(actions)} 个方向,已完成 {len(completed)} 个。\n')
+            lines.append(f'📎 素材来源：{source_meta.get("platform", "")} — {source_meta["url"]}\n')
+        lines.append(f'共 {len(actions)} 个方向，已完成 {len(completed)} 个。\n')
 
         lines.append('## ⚡ 执行成果\n')
         for a in actions:
             icon = ACTION_META.get(a['action_type'], {}).get('icon', '❓')
             status_icon = '✅' if a.get('status') == 'completed' else ('⏭️' if a.get('status') == 'skipped' else '⬜')
             lines.append(f'### {status_icon} {icon} {a["title"]}')
-            lines.append(f'**类型**:{_type_badge(a["action_type"])} | **状态**:{_status_badge(a["status"])[0]}\n')
+            lines.append(f'**类型**：{_type_badge(a["action_type"])} | **状态**：{_status_badge(a["status"])[0]}\n')
             lines.append(f'{a["description"]}\n')
             if a.get('result_ref'):
-                lines.append(f'**成果**:{a["result_ref"]}\n')
+                lines.append(f'**成果**：{a["result_ref"]}\n')
             if a.get('result_summary'):
                 lines.append(f'{a["result_summary"]}\n')
             lines.append('')
@@ -1660,7 +1486,7 @@ def _link_results(params):
         summary_body = '\n'.join(lines)
 
         # Create summary note
-        summary_title = f'📋 SproutForge 汇总:{note_title or source_id[:12]}'
+        summary_title = f'📋 SproutForge 汇总：{note_title or source_id[:12]}'
         try:
             cn = syscall('create_note', {'title': summary_title, 'content': summary_body})
             cn_data = cn.get('data', cn) if isinstance(cn, dict) else {}
@@ -1669,7 +1495,7 @@ def _link_results(params):
             LOGGER.error('link.create_note', 'failed to create summary note', {'error': str(e)})
             summary_note_id = ''
 
-        # Update original note: append ⚡ 执行成果 section (idempotent - skip if already exists)
+        # Update original note: append ⚡ 执行成果 section (idempotent — skip if already exists)
         appended = False
         if note_id:
             try:
@@ -1678,7 +1504,7 @@ def _link_results(params):
                     LOGGER.info('link.idempotent', 'original note already has results section, skipping append', {'note_id': note_id})
                 else:
                     append_section = '\n\n---\n## ⚡ 执行成果\n\n'
-                    append_section += f'> 由 SproutForge 自动生成 | 汇总笔记:'
+                    append_section += f'> 由 SproutForge 自动生成 | 汇总笔记：'
                     if summary_note_id:
                         append_section += f':remio-inlink[{summary_title}]{{#{summary_note_id}}}\n\n'
                     else:
@@ -1686,7 +1512,7 @@ def _link_results(params):
 
                     for a in completed:
                         icon = ACTION_META.get(a['action_type'], {}).get('icon', '❓')
-                        append_section += f'- {icon} **{a["title"]}** - {a.get("result_summary", "已完成")}'
+                        append_section += f'- {icon} **{a["title"]}** — {a.get("result_summary", "已完成")}'
                         if a.get('result_ref'):
                             ref = a['result_ref']
                             if ref.startswith('note://'):
@@ -1722,7 +1548,7 @@ def _link_results(params):
 
         LOGGER.info('link_results', 'results linked', {'note_id': note_id, 'summary_id': summary_note_id, 'appended': appended})
 
-        # 多目的地保存:Obsidian + Get笔记(汇总笔记分发到内容库)
+        # 多目的地保存：Obsidian + Get笔记（汇总笔记分发到内容库）
         vault_status = ''
         try:
             sf_platform = source_meta.get('platform', '') if source_meta else ''
@@ -1758,7 +1584,7 @@ def _link_results(params):
             vault_status = f'失败: {e}'
             LOGGER.error('link_results.multi_save', f'failed: {e}', {})
 
-        # --- 方向 C:执行成果反哺知识库 ---
+        # --- 方向 C：执行成果反哺知识库 ---
         # 检测知识库中是否有与本次成果相关的旧笔记
         related_notes = []
         try:
@@ -1778,11 +1604,11 @@ def _link_results(params):
         except Exception as e:
             LOGGER.error('link.rag_feedback', 'failed to search related notes', {'error': str(e)})
 
-        # 如果找到相关旧笔记,追加到汇总笔记
+        # 如果找到相关旧笔记，追加到汇总笔记
         if related_notes:
             try:
                 feedback_section = '\n\n---\n## 🔄 相关旧笔记\n\n'
-                feedback_section += '以下知识库笔记可能与本次成果相关,建议检查是否需要更新:\n\n'
+                feedback_section += '以下知识库笔记可能与本次成果相关，建议检查是否需要更新：\n\n'
                 for rn in related_notes[:5]:
                     feedback_section += f'- :remio-inlink[{rn["title"]}]{{#{rn["id"]}}}\n'
                 if summary_note_id:
@@ -1808,15 +1634,15 @@ def _link_results(params):
 
 
 # ---------------------------------------------------------------------------
-# 方向 B:沉睡方向扫描(可被 scheduler 定时调用)
+# 方向 B：沉睡方向扫描（可被 scheduler 定时调用）
 # ---------------------------------------------------------------------------
 
 @router.route('GET', '/scan_dormant')
 def _scan_dormant(params):
-    """扫描沉睡方向:提取超过 N 天仍未启动的方向。
+    """扫描沉睡方向：提取超过 N 天仍未启动的方向。
 
-    可被 scheduler aApp 定时调用,实现「自主提醒」。
-    返回沉睡方向列表 + 汇总统计,供 Agent 生成提醒消息。
+    可被 scheduler aApp 定时调用，实现「自主提醒」。
+    返回沉睡方向列表 + 汇总统计，供 Agent 生成提醒消息。
     """
     days = int(params.get('days', 3))
     db = _open_db()
@@ -1837,7 +1663,7 @@ def _scan_dormant(params):
         if not dormant:
             return {
                 'status': 'ok',
-                'message': f'没有沉睡方向(超过 {days} 天未执行)',
+                'message': f'没有沉睡方向（超过 {days} 天未执行）',
                 'dormant_count': 0,
                 'dormant': []
             }
@@ -1868,7 +1694,7 @@ def _scan_dormant(params):
         note_count = len(by_note)
         oldest = max(int((now_ts - a['created_at']) / 86400) for a in dormant)
 
-        reminder = f'💤 SproutForge 提醒:你有 {total} 个方向提取后超过 {days} 天未执行(来自 {note_count} 篇笔记),最早已沉睡 {oldest} 天。'
+        reminder = f'💤 SproutForge 提醒：你有 {total} 个方向提取后超过 {days} 天未执行（来自 {note_count} 篇笔记），最早已沉睡 {oldest} 天。'
 
         # 构建精简列表
         dormant_list = []
@@ -1900,73 +1726,6 @@ def _scan_dormant(params):
                 'params': {},
                 'aapp_id': 'sproutforge',
             },
-        }
-    finally:
-        db.close()
-
-
-# ---------------------------------------------------------------------------
-# Status endpoint for Agent aggregation
-# ---------------------------------------------------------------------------
-@router.route('GET', '/status')
-def _get_status(_params):
-    """Return sproutforge runtime status for Agent aggregation."""
-    db = _open_db()
-    try:
-        total_actions = db.query('SELECT COUNT(*) as c FROM sprout_actions')[0]['c']
-        pending = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'pending'")[0]['c']
-        running = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'running'")[0]['c']
-        completed = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'completed'")[0]['c']
-        failed = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'failed'")[0]['c']
-
-        # Alerts: stuck running (>7 days) or failed items
-        alerts = []
-        now_ts = _now()
-        stuck_cutoff = now_ts - 7 * 86400
-        stuck = db.query(
-            "SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'running' AND updated_at < :cutoff",
-            {'cutoff': stuck_cutoff}
-        )
-        stuck_count = stuck[0]['c'] if stuck else 0
-        if stuck_count > 0:
-            alerts.append({
-                'level': 'warning',
-                'message': f'{stuck_count} directions stuck in running for >7 days'
-            })
-        if failed > 0:
-            alerts.append({
-                'level': 'error',
-                'message': f'{failed} directions failed'
-            })
-
-        # Recent 5 actions by updated_at
-        recent_rows = db.query(
-            'SELECT title, action_type, status, updated_at FROM sprout_actions ORDER BY updated_at DESC LIMIT 5'
-        )
-        recent = []
-        for row in recent_rows:
-            ts = int(row.get('updated_at') or 0)
-            recent.append({
-                'title': str(row.get('title') or '')[:50],
-                'type': str(row.get('action_type') or ''),
-                'status': str(row.get('status') or ''),
-                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(ts)) if ts > 0 else '',
-            })
-
-        overall = 'error' if failed > 0 else ('warning' if stuck_count > 0 else 'healthy')
-        return {
-            'aapp_id': 'sproutforge',
-            'status': overall,
-            'summary': {
-                'active_items': total_actions,
-                'pending_items': pending,
-                'running_items': running,
-                'completed_items': completed,
-                'failed_items': failed,
-            },
-            'alerts': alerts,
-            'recent': recent,
-            'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(now_ts)),
         }
     finally:
         db.close()
