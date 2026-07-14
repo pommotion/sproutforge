@@ -1453,7 +1453,7 @@ def _batch_execute(params):
         now = _now()
         plan = []
         for a in actions:
-            db.exec('UPDATE sprout_actions SET status = ?, updated_at = ? WHERE id = ?', ['running', now, a['id']])
+            db.exec('UPDATE sprout_actions SET status = ?, updated_at = ? WHERE id = ?', ['queued', now, a['id']])
             plan.append({
                 'action_id': a['id'],
                 'title': a['title'],
@@ -1468,7 +1468,8 @@ def _batch_execute(params):
             'source_id': source_id,
             'plan_count': len(plan),
             'plan': plan,
-            'message': f'已生成 {len(plan)} 个方向的执行计划。Agent 请按顺序执行,每个完成后调用 /complete 回传。',
+            'first_action': plan[0] if plan else None,
+            'message': f'已准备 {len(plan)} 个方向的执行计划。正在执行第一个: 「{plan[0]["title"] if plan else ""}」。Agent 请执行 first_action 的 exec_prompt,完成后调用 /complete。',
         }
     finally:
         db.close()
@@ -1543,22 +1544,60 @@ def _complete(params):
             _add_to_sprout_collection(result_note_id)
             LOGGER.info('complete.collection', f'added result note {result_note_id} to SproutForge collection')
 
-        # Check if all done → send chat message
+        # --- 链式驱动 + 进度推送 ---
         source_id = action.get('source_id') or action.get('note_id')
-        remaining = db.query("SELECT COUNT(*) as cnt FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) AND status NOT IN ('completed', 'skipped')", {'sid': source_id, 'nid': source_id})
-        if remaining and remaining[0]['cnt'] == 0:
-            try:
-                from remio_sdk import send_chat_message
-                send_chat_message(f'✅ 流水线全部完成!所有方向已执行。可调用 /link-results 进行成果回链。source_id={source_id}')
-            except Exception:
-                pass
 
-        return {
+        # 统计完成进度
+        all_actions = db.query(
+            "SELECT id, title, action_type, exec_prompt, status, direction_index FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) ORDER BY direction_index",
+            {'sid': source_id, 'nid': source_id}
+        )
+        total = len(all_actions)
+        done_count = sum(1 for a in all_actions if a['status'] in ('completed', 'skipped'))
+
+        # 查找下一个 queued 方向
+        next_queued = None
+        for a in all_actions:
+            if a['status'] == 'queued':
+                next_queued = a
+                break
+
+        # 标记下一个 queued 方向为 running（不依赖 send_chat_message）
+        if next_queued:
+            now2 = _now()
+            db.exec('UPDATE sprout_actions SET status = ?, updated_at = ? WHERE id = ?', ['running', now2, next_queued['id']])
+
+        # 推送进度（send_chat_message 失败不影响状态流转）
+        try:
+            from remio_sdk import send_chat_message
+            if next_queued is None:
+                send_chat_message(f'🎉 [{done_count}/{total}] 全部 {total} 个方向执行完成，正在回链...')
+            else:
+                send_chat_message(f'✅ [{done_count}/{total}] 「{action["title"]}」已完成，下一个: 「{next_queued["title"]}」')
+        except Exception:
+            pass
+
+        result = {
             'action_id': action_id,
             'status': 'completed',
             'result_ref': result_ref,
             'result_note_added_to_collection': bool(result_note_id),
+            'progress': f'{done_count}/{total}',
         }
+
+        if next_queued:
+            result['next_action'] = {
+                'action_id': next_queued['id'],
+                'title': next_queued['title'],
+                'action_type': next_queued['action_type'],
+                'exec_prompt': next_queued.get('exec_prompt', ''),
+            }
+            result['pipeline_completed'] = False
+        else:
+            result['next_action'] = None
+            result['pipeline_completed'] = True
+
+        return result
     finally:
         db.close()
 
@@ -1584,6 +1623,58 @@ def _skip(params):
 
         LOGGER.info('skip', f'action {action_id} skipped', {'reason': reason})
         return {'action_id': action_id, 'status': 'skipped'}
+    finally:
+        db.close()
+
+
+@router.route('POST', '/reset-stuck')
+def _reset_stuck(params):
+    """重置超时 running 的方向为 queued，支持中断恢复。"""
+    source_id = (params.get('source_id') or '').strip()
+    timeout_minutes = int(params.get('timeout_minutes') or 10)
+    timeout_seconds = timeout_minutes * 60
+
+    db = _open_db()
+    try:
+        now = _now()
+        cutoff = now - timeout_seconds
+
+        if source_id:
+            stuck = db.query(
+                "SELECT * FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) AND status = 'running' AND updated_at < :cutoff",
+                {'sid': source_id, 'nid': source_id, 'cutoff': cutoff}
+            )
+        else:
+            stuck = db.query(
+                "SELECT * FROM sprout_actions WHERE status = 'running' AND updated_at < :cutoff",
+                {'cutoff': cutoff}
+            )
+
+        if not stuck:
+            return {'reset_count': 0, 'message': '没有检测到卡住的方向'}
+
+        now_val = now
+        for a in stuck:
+            db.exec('UPDATE sprout_actions SET status = ?, updated_at = ? WHERE id = ?', ['queued', now_val, a['id']])
+            if source_id:
+                _update_pipeline_progress(db, source_id)
+
+        # 如果没指定 source_id，逐个 pipeline 更新进度
+        if not source_id:
+            reset_sources = set()
+            for a in stuck:
+                sid = a.get('source_id') or a.get('note_id')
+                if sid:
+                    reset_sources.add(sid)
+            for sid in reset_sources:
+                _update_pipeline_progress(db, sid)
+
+        LOGGER.info('reset_stuck', f'reset {len(stuck)} stuck actions to queued', {'timeout_minutes': timeout_minutes})
+        return {
+            'reset_count': len(stuck),
+            'reset_actions': [{'action_id': a['id'], 'title': a['title']} for a in stuck],
+            'message': f'已重置 {len(stuck)} 个卡住的方向为 queued，可重新执行',
+        }
     finally:
         db.close()
 
@@ -1919,19 +2010,27 @@ def _get_status(_params):
         completed = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'completed'")[0]['c']
         failed = db.query("SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'failed'")[0]['c']
 
-        # Alerts: stuck running (>7 days) or failed items
+        # Alerts: stuck running (>10 min) or failed items
         alerts = []
         now_ts = _now()
-        stuck_cutoff = now_ts - 7 * 86400
-        stuck = db.query(
-            "SELECT COUNT(*) as c FROM sprout_actions WHERE status = 'running' AND updated_at < :cutoff",
+        stuck_cutoff = now_ts - 10 * 60  # 10 分钟
+        stuck_rows = db.query(
+            "SELECT id, title, updated_at FROM sprout_actions WHERE status = 'running' AND updated_at < :cutoff",
             {'cutoff': stuck_cutoff}
         )
-        stuck_count = stuck[0]['c'] if stuck else 0
+        stuck_count = len(stuck_rows)
+        stuck_actions = []
+        for row in stuck_rows:
+            running_min = int((now_ts - int(row.get('updated_at') or 0)) / 60)
+            stuck_actions.append({
+                'action_id': row['id'],
+                'title': str(row.get('title') or '')[:50],
+                'running_for_minutes': running_min,
+            })
         if stuck_count > 0:
             alerts.append({
                 'level': 'warning',
-                'message': f'{stuck_count} directions stuck in running for >7 days'
+                'message': f'{stuck_count} directions stuck in running for >10 min, call POST /reset-stuck to recover'
             })
         if failed > 0:
             alerts.append({
@@ -1965,6 +2064,7 @@ def _get_status(_params):
                 'failed_items': failed,
             },
             'alerts': alerts,
+            'stuck_actions': stuck_actions,
             'recent': recent,
             'last_updated': time.strftime('%Y-%m-%dT%H:%M:%S+08:00', time.localtime(now_ts)),
         }

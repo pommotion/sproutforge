@@ -106,12 +106,20 @@ v4 引入知识库感知能力，解决「每次发芽都从零开始」的问�
   - params: `action_id` (string, required)
   - 返回: `{ exec_prompt, action_type, title }`
 
-- `POST /batch-execute` — 批量生成执行计划
+- `POST /batch-execute` — 批量准备执行计划
   - params: `source_id` (string, required)
-  - 返回: `{ plan[], plan_count }`
+  - 行为：将 pending 方向标记为 queued（非 running），返回 plan + first_action
+  - 返回: `{ plan[], plan_count, first_action, message }`
 
-- `POST /complete` — 标记完成 + 成果回传
+- `POST /complete` — 标记完成 + 成果回传 + 链式驱动
   - params: `action_id` (string, required), `result_ref` (string), `result_summary` (string)
+  - 返回: `{ action_id, status, result_ref, progress, next_action, pipeline_completed }`
+  - 链式驱动：`next_action` 包含下一个 queued 方向的完整信息（或 null 表示全部完成）
+  - 副作用：自动 send_chat_message 推送进度，并标记 next_action 为 running
+
+- `POST /reset-stuck` — 卡死恢复：重置超时 running → queued
+  - params: `source_id` (string, optional), `timeout_minutes` (integer, optional, default=10)
+  - 返回: `{ reset_count, reset_actions[], message }`
 
 - `POST /skip` — 跳过某个方向
   - params: `action_id` (string, required), `reason` (string, optional)
@@ -127,21 +135,33 @@ v4 引入知识库感知能力，解决「每次发芽都从零开始」的问�
 
 aApp 不能直接调用 agent skill。本协议是 Agent 的操作手册——**Agent 读完本节后，应能在没有用户介入的情况下自动执行所有方向**。
 
+### v4.1 链式执行模型
+
+v4.1 引入**链式驱动**取代旧的批量执行模型。核心变化：
+
+1. **batch-execute 不再标记 running**：所有方向标记为 `queued`，同一时刻最多一个 `running`
+2. **/complete 返回 next_action**：完成一个方向后，响应自带下一个待执行方向的完整信息
+3. **Agent 不需要记住计划**：每次 /complete 响应自带下一步，Agent 自然接力
+4. **send_chat_message 推进度**：每完成一个方向自动推送 `[N/total]` 进度
+5. **卡死恢复**：POST /reset-stuck 重置超时 running → queued
+
 ### 触发条件
 
 以下任一情况，Agent 应启动自动执行流程：
 - 用户说「执行」「开始执行」「跑一下」「全部执行」等
-- SproutForge 返回 batch-execute 结果包含 `"message": "...Agent 请按顺序执行..."`
+- Agent 看到 `/batch-execute` 或 `/complete` 返回中有 `next_action` 不为 null
 - Agent 看到 `/execute` 或 `/batch-execute` 返回中有 exec_prompt 且包含 skill 名称（如 /deep-research）
 
-### 执行流程
+### 执行流程（链式）
 
 ```
-步骤1: GET /plan/:source_id → 读取待执行计划
-步骤2: 对每个 item，按 action_type 分发到对应 skill
-步骤3: 每个 skill 产出成果后 → POST /complete 回传
-步骤4: 全部完成 → POST /link-results 回链+汇总
+步骤1: POST /batch-execute(source_id) → 拿到 first_action
+步骤2: 执行 first_action（按 action_type 调对应 skill）
+步骤3: POST /complete(action_id, result_ref) → 拿到 next_action
+步骤4: next_action 不为 null → 回到步骤2；next_action 为 null → POST /link-results
 ```
+
+> **关键**：Agent 不需要调用 GET /plan 循环。batch-execute 返回 first_action，后续每个 /complete 都自带 next_action。Agent 只需反复「执行 → /complete → 检查 next_action」。
 
 ### action_type → skill 路由表
 
@@ -156,26 +176,30 @@ aApp 不能直接调用 agent skill。本协议是 Agent 的操作手册——**
 
 ### 详细步骤
 
-**步骤 1：读取计划**
-Agent 调用 `POST /batch-execute`（params: source_id）或 `GET /plan/:source_id`，获得 plan 列表。每个 item 包含 action_id, title, action_type, exec_prompt。
+**步骤 1：启动执行**
+Agent 调用 `POST /batch-execute`（params: source_id），获得 plan 列表和 `first_action`。first_action 包含 action_id, title, action_type, exec_prompt。
 
-**步骤 2：逐个执行**
-按 direction_index 顺序执行。对每个 item：
+**步骤 2：执行当前方向**
+对 first_action 或后续的 next_action：
 
 1. 读取 `action_type` 字段
 2. 按路由表调用对应 skill（exec_prompt 已经包含了完整调用指令）
 3. skill 执行完成，获得成果（通常是一个 note_id 或文件路径）
 4. 如果执行失败或不需要执行，调用 `POST /skip`（params: action_id, reason）
 
-**步骤 3：回传成果**
+**步骤 3：回传成果 + 获取下一个**
 每个方向成功执行后，Agent 立即调用：
 ```
 POST /complete
-params: action_id=<该方向的id>, result_ref=<成果note_id或URL>, result_summary=<一句话总结>
+params: action_id=<当前方向的id>, result_ref=<成果note_id或URL>, result_summary=<一句话总结>
 ```
+响应中包含：
+- `progress`: 当前进度（如 `2/5`）
+- `next_action`: 下一个 queued 方向的完整信息（或 null）
+- `pipeline_completed`: 是否全部完成
 
 **步骤 4：回链汇总**
-所有方向状态都是 completed 或 skipped 后，Agent 调用：
+当 `next_action` 为 null 或 `pipeline_completed` 为 true 时：
 ```
 POST /link-results
 params: source_id=<source_id>
@@ -188,23 +212,28 @@ params: source_id=<source_id>
 
 ### 中断恢复
 
-如果执行中断（Agent 会话结束、网络问题等），重新开始时：
-1. Agent 调用 `GET /plan/:source_id`，查看哪些方向还是 queued/running
-2. 从未完成的方向继续执行
-3. 已 completed 的不会重复执行
+如果执行中断（Agent 会话结束、网络问题等）：
+1. 用户重新说「继续执行」
+2. Agent 调用 `GET /plan/:source_id`，查看哪些方向还是 queued/running
+3. 如果有 running 方向，先调 `POST /reset-stuck`（重置超时 running → queued）
+4. 从未完成的 queued 方向继续执行（用 POST /execute 拿 exec_prompt，或直接从 /plan 读取）
+5. 已 completed 的不会重复执行
 
 ### 注意事项
 
 - exec_prompt 是预生成好的完整调用指令，Agent 可以直接作为消息理解执行
-- 一次只执行一个方向，完成并 `/complete` 后再开始下一个
+- 一次只执行一个方向，完成并 `/complete` 后再开始下一个（/complete 返回的 next_action 就是下一个）
 - `archive` 类型不需要调 skill，直接 create_note + add_note_to_collection 即可
 - 如果用户只说「执行」而没指定哪个 source_id，Agent 应先查看 `/dashboard_ui` 或询问用户
+- `/complete` 会自动 send_chat_message 推进度（C 模式），用户无需反复刷新
+- v4.1 起批量执行不再一次性标记所有方向为 running，避免断链后全部卡死
 
-## 数据模型
+### 数据模型
 
 独立 SQLite（`data/db/app.sqlite`），2 张表：
 
 - **`sprout_actions`**: 发芽方向/行动项（id, source_id, note_id, direction_index, title, description, action_type, action_subtype, priority, status, exec_prompt, result_ref, result_summary, created_at, updated_at, kb_relation, kb_note_id, kb_note_title）
+  - status 枚举：`pending` → `queued` → `running` → `completed`/`skipped`/`failed`
   - v4 新增：`kb_relation`（new/update/deepen）、`kb_note_id`、`kb_note_title`
 - **`pipelines`**: 执行流水线（id, source_id, note_id, total_actions, completed_actions, status, summary_note_id, meta, created_at, updated_at）
 

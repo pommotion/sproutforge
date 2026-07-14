@@ -103,6 +103,16 @@
       }
     },
     {
+      "method": "POST",
+      "path": "/reset-stuck",
+      "type": "data",
+      "description": "重置超时 running 的方向为 queued（卡死恢复）",
+      "params": {
+        "source_id": {"type": "string", "required": false},
+        "timeout_minutes": {"type": "integer", "required": false}
+      }
+    },
+    {
       "method": "GET",
       "path": "/plan/:source_id",
       "type": "data",
