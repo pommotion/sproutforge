@@ -1,0 +1,135 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/",
+      "type": "ui",
+      "description": "主页：URL 输入 + @ 笔记引导 + 看板/历史按钮"
+    },
+    {
+      "method": "POST",
+      "path": "/extract",
+      "type": "data",
+      "description": "从发芽笔记提取方向 + AI 分类",
+      "params": {
+        "note_id": {"type": "string", "required": false},
+        "source_id": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/pipeline/:source_id",
+      "type": "ui",
+      "description": "查看单条流水线详情：方向列表 + 进度（命名豁免：含路径参数）"
+    },
+    {
+      "method": "GET",
+      "path": "/dashboard_ui",
+      "type": "ui",
+      "description": "全局看板：所有进行中的流水线"
+    },
+    {
+      "method": "GET",
+      "path": "/history_ui",
+      "type": "ui",
+      "description": "历史记录：已完成的流水线"
+    },
+    {
+      "method": "GET",
+      "path": "/stats_ui",
+      "type": "ui",
+      "description": "知识→行动转化率仪表盘：全局漏斗 + 沉睡方向 + 类型分布"
+    },
+    {
+      "method": "POST",
+      "path": "/reclassify",
+      "type": "data",
+      "description": "重新分类某个方向",
+      "params": {
+        "action_id": {"type": "string", "required": false},
+        "action_type": {"type": "string", "required": false},
+        "action_subtype": {"type": "string", "required": false},
+        "priority": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/confirm",
+      "type": "data",
+      "description": "确认分类，进入执行队列",
+      "params": {
+        "source_id": {"type": "string", "required": false},
+        "note_id": {"type": "string", "required": false},
+        "action_ids": {"type": "string", "required": false, "description": "JSON array string, e.g. \"[\"id1\",\"id2\"]\" or comma-separated \"id1,id2\""}
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/execute",
+      "type": "data",
+      "description": "执行单个方向（生成执行 prompt）",
+      "params": {
+        "action_id": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/batch-execute",
+      "type": "data",
+      "description": "批量执行：生成所有 queued 方向的执行计划",
+      "params": {
+        "source_id": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/complete",
+      "type": "data",
+      "description": "标记完成 + 成果回传",
+      "params": {
+        "action_id": {"type": "string", "required": false},
+        "result_ref": {"type": "string", "required": false},
+        "result_summary": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/skip",
+      "type": "data",
+      "description": "跳过某个方向",
+      "params": {
+        "action_id": {"type": "string", "required": false},
+        "reason": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/plan/:source_id",
+      "type": "data",
+      "description": "获取执行计划（Agent 读取执行）"
+    },
+    {
+      "method": "GET",
+      "path": "/scan_dormant",
+      "type": "data",
+      "description": "扫描沉睡方向（超过N天未启动），返回提醒列表"
+    },
+    {
+      "method": "POST",
+      "path": "/link-results",
+      "type": "data",
+      "description": "成果回链到原始笔记 + 新建汇总笔记",
+      "params": {
+        "source_id": {"type": "string", "required": false},
+        "note_id": {"type": "string", "required": false}
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/status",
+      "type": "data",
+      "description": "Return sproutforge runtime status (health, action counts, stuck/failed alerts, recent activity) for Agent aggregation.",
+      "params": {}
+    }
+  ]
+}

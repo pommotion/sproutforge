@@ -1,0 +1,62 @@
+{
+  "id": "sproutforge",
+  "name": "SproutForge 发芽锻造器",
+  "nameI18n": {
+    "zh-CN": "SproutForge 发芽锻造器",
+    "en-US": "SproutForge"
+  },
+  "icon": "🌱",
+  "type": "aapp",
+  "version": "4",
+  "developer": "violin",
+  "description": "从素材到执行的一体化入口。粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。",
+  "descriptionI18n": {
+    "zh-CN": "从素材到执行的一体化入口。粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。",
+    "en-US": "All-in-one engine from raw material to execution: paste a link to auto-fetch and create a sprout note, or @ any note to extract directions, AI-classify, generate execution plans, and link results back."
+  },
+  "activationAction": {
+    "method": "GET",
+    "path": "/"
+  },
+  "runtime": {
+    "type": "embedded"
+  },
+  "chatMenu": [
+    {
+      "label": "提取方向",
+      "labelI18n": { "zh-CN": "提取方向", "en-US": "Extract" },
+      "action": {
+        "method": "GET",
+        "path": "/",
+        "prompt": "打开 SproutForge，提取发芽方向"
+      }
+    },
+    {
+      "label": "执行看板",
+      "labelI18n": { "zh-CN": "执行看板", "en-US": "Dashboard" },
+      "action": {
+        "method": "GET",
+        "path": "/dashboard_ui",
+        "prompt": "查看 SproutForge 执行看板"
+      }
+    },
+    {
+      "label": "历史记录",
+      "labelI18n": { "zh-CN": "历史记录", "en-US": "History" },
+      "action": {
+        "method": "GET",
+        "path": "/history_ui",
+        "prompt": "查看 SproutForge 历史记录"
+      }
+    },
+    {
+      "label": "转化仪表盘",
+      "labelI18n": { "zh-CN": "转化仪表盘", "en-US": "Stats" },
+      "action": {
+        "method": "GET",
+        "path": "/stats_ui",
+        "prompt": "查看知识→行动转化仪表盘"
+      }
+    }
+  ]
+}
