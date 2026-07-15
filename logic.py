@@ -392,6 +392,90 @@ def _ai_extract_single(prompt, system_prompt):
 
 
 # ---------------------------------------------------------------------------
+# Sprout note creation (for /fetch path: no remio note exists yet)
+# ---------------------------------------------------------------------------
+
+_SUMMARY_SYSTEM = 'You are a content analyst. Generate a concise, insightful summary of the given content. Write in the same language as the content. Output ONLY the summary text, no markdown fences, no headings.'
+
+
+def _ai_generate_summary(content, title=''):
+    """Generate a 3-5 sentence AI summary of the source content.
+    Returns summary string, or '' on failure (non-fatal).
+    """
+    truncated = content[:6000]
+    try:
+        result = run_prompt(
+            prompt=f'请为以下内容生成 3-5 句精炼摘要,提炼核心观点和价值点。\n\n标题:{title or "(无标题)"}\n\n内容:\n{truncated}',
+            system_prompt=_SUMMARY_SYSTEM,
+            timeout_ms=30000,
+        )
+        text = result if isinstance(result, str) else str(result)
+        text = text.strip()
+        if text.startswith('```'):
+            text = re.sub(r'^```(?:\w+)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text)
+        return text.strip()
+    except Exception as e:
+        LOGGER.warn('ai_summary', 'summary generation failed', {'error': str(e)})
+        return ''
+
+
+def _create_sprout_note(title, source_meta, summary, directions, raw_content):
+    """Create a complete sprout note in remio. Returns note_id or ''.
+    Structure: AI summary + 🌿 发芽扩展 directions + 📝 原始内容
+    """
+    lines = [f'# 🌱 {title} 发芽笔记']
+
+    # Source info
+    if source_meta and source_meta.get('url'):
+        lines.append(f'> 来源: {source_meta.get("platform", "")} - {source_meta["url"]}')
+    lines.append(f'> 抓取时间: {_now()[:10]}')
+    lines.append('')
+
+    # AI summary
+    if summary:
+        lines.append('## 📋 AI 摘要')
+        lines.append('')
+        lines.append(summary)
+        lines.append('')
+
+    # Directions
+    lines.append('## 🌿 发芽扩展')
+    lines.append('')
+    for i, direction in enumerate(directions):
+        first_line = direction.split('\n')[0].strip().lstrip('*#').strip()
+        rest = direction[len(direction.split(chr(10))[0]):].strip()
+        lines.append(f'### 方向 {i + 1}：{first_line}')
+        if rest:
+            lines.append(rest)
+        lines.append('')
+
+    # Raw content
+    lines.append('---')
+    lines.append('## 📝 原始内容')
+    lines.append('')
+    # Truncate very long content to keep note manageable
+    if len(raw_content) > 20000:
+        lines.append(raw_content[:20000])
+        lines.append(f'\n... (原始内容过长,已截断,共 {len(raw_content)} 字符)')
+    else:
+        lines.append(raw_content)
+
+    note_body = '\n'.join(lines)
+
+    try:
+        resp = syscall('create_note', {'title': f'🌱 {title} 发芽笔记', 'content': note_body})
+        data = resp.get('data', resp) if isinstance(resp, dict) else {}
+        note_id = data.get('noteId', '')
+        if note_id:
+            LOGGER.info('create_sprout_note', 'sprout note created', {'note_id': note_id, 'title': title})
+        return note_id
+    except Exception as e:
+        LOGGER.error('create_sprout_note', 'failed to create sprout note', {'error': str(e)})
+        return ''
+
+
+# ---------------------------------------------------------------------------
 # Classification: rule pre-filter + AI fallback
 # ---------------------------------------------------------------------------
 
@@ -925,6 +1009,23 @@ def _extract(params):
                 return {'error': 'no_directions', 'message': f'未找到「🌿 发芽扩展」章节,AI 也无法从笔记内容中提取有效方向。详细原因:{ai_error}'}
 
         LOGGER.info('extract.directions', f'extracted {len(raw_directions)} directions', {'note_id': note_id})
+
+        # --- Create sprout note for /fetch path (no remio note exists yet) ---
+        # When entering via source_id without a note_id, we have raw content from
+        # content-router but no remio note. Create a complete sprout note so the
+        # user has something to see and /link-results has a note to append to.
+        if source_id and not note_id:
+            LOGGER.info('extract.create_note', 'creating sprout note for /fetch path', {'source_id': source_id})
+            summary = _ai_generate_summary(note_content, note_title or '')
+            # Resolve source_meta early for the note creation
+            sm = meta if meta is not None else (_get_source_meta(source_id) if source_id else {})
+            sprout_title = note_title or sm.get('title', '') or source_id[:12]
+            new_note_id = _create_sprout_note(sprout_title, sm, summary, raw_directions, note_content)
+            if new_note_id:
+                note_id = new_note_id
+                LOGGER.info('extract.create_note', 'sprout note created, note_id set', {'note_id': note_id})
+            else:
+                LOGGER.warn('extract.create_note', 'sprout note creation failed, continuing without note_id', {})
 
         # --- C1: KB context retrieval (one search for all directions) ---
         # Resolve source_meta early (needed for KB search context)
