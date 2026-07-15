@@ -842,7 +842,7 @@ def _home(params):
                 'label': '🚀 抓取 + 提取方向',
                 'style': 'primary',
                 'action': {
-                    'promptTemplate': '请处理这个素材链接并提取发芽方向。\n\n步骤:\n1. 调用 content-router aApp 的 POST /process 接口,参数 url={url},完成抓取和发芽笔记生成\n2. 从返回结果中获取 note_id\n3. 调用 sproutforge aApp 的 POST /extract 接口,参数 note_id=<上一步获取的note_id>\n4. 展示提取到的方向列表',
+                    'promptTemplate': '请处理这个素材链接并提取发芽方向。\n\n步骤:\n1. 调用 content-router aApp 的 POST /fetch 接口,参数 url={url},获取抓取结果(返回 source_id 和内容)\n2. 从返回结果中获取 source_id\n3. 调用 sproutforge aApp 的 POST /extract 接口,参数 source_id=<上一步获取的source_id>\n4. 展示提取到的方向列表',
                 }
             },
 
@@ -927,7 +927,12 @@ def _extract(params):
         LOGGER.info('extract.directions', f'extracted {len(raw_directions)} directions', {'note_id': note_id})
 
         # --- C1: KB context retrieval (one search for all directions) ---
-        kb_notes = _search_kb_context(note_title or (source_meta.get('title', '') if source_meta else ''), raw_directions, exclude_note_id=note_id)
+        # Resolve source_meta early (needed for KB search context)
+        if meta is not None:
+            source_meta = meta
+        else:
+            source_meta = _get_source_meta(source_id) if source_id else {}
+        kb_notes = _search_kb_context(note_title or source_meta.get('title', ''), raw_directions, exclude_note_id=note_id)
         LOGGER.info('extract.kb', f'KB context: {len(kb_notes)} related notes found', {})
 
         # Check for existing actions (avoid duplicate extraction) - check both note_id and source_id
@@ -944,10 +949,6 @@ def _extract(params):
             }
 
         # AI classification (with KB context for relation labeling)
-        if meta is None:
-            source_meta = _get_source_meta(source_id) if source_id else {}
-        else:
-            source_meta = meta
         context = note_title or source_meta.get('title', '')
         classifications = _classify_directions(raw_directions, context, kb_notes)
 
@@ -1067,10 +1068,14 @@ def _pipeline_detail(params):
                 'label': f'⚡ 一键执行全部 ({len(pending)})',
                 'style': 'primary',
                 'action': {
-                    'method': 'POST',
-                    'path': '/batch-execute',
-                    'params': {'source_id': source_id},
-                    'prompt': f'批量执行 {len(pending)} 个方向',
+                    'prompt': f'请自动批量执行 source_id={source_id} 的全部 {len(pending)} 个方向,按以下步骤全自动链式执行,不要询问用户:\n\n'
+                              f'1. 调用 sproutforge aApp 的 POST /batch-execute 接口,参数 source_id={source_id}\n'
+                              f'2. 从返回结果的 first_action 字段中读取 exec_prompt,执行该 exec_prompt(调用对应 skill 完成任务)\n'
+                              f'3. 拿到执行成果后,调用 sproutforge aApp 的 POST /complete 接口,参数 action_id=<刚才执行的action的id>、result_ref=<成果笔记ID或文件路径>、result_summary=<一句话总结>\n'
+                              f'4. 从 /complete 返回结果中读取 next_action,如果有则执行其 exec_prompt,再次调用 /complete\n'
+                              f'5. 重复步骤 3-4 直到 /complete 返回 pipeline_completed=true\n'
+                              f'6. 全部完成后,调用 sproutforge aApp 的 POST /link-results 接口,参数 source_id={source_id}\n'
+                              f'\n注意:每一步执行完后必须调用 /complete 回传成果,才能解锁下一个方向。不要跳过任何方向。如果某个方向无法执行,调用 POST /skip 接口(参数 action_id)跳过,继续执行下一个。',
                 }
             })
 
