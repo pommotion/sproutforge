@@ -262,9 +262,11 @@ _NEXT_SECTION_RE = re.compile(r'\n##\s*🧠|---|\Z')
 def _extract_directions_from_note(note_content):
     """Parse '## 🌿 发芽扩展' section and split into individual directions.
 
-    Handles two formats:
-    1. content-router sprout notes: '### 方向 N:title\ndescription'
-    2. Generic numbered/bulleted lists: '1. ...' or '- ...' or '• ...'
+    Handles three numbering formats:
+    1. content-router sprout notes: '### 方向 N：title\ndescription'
+    2. Standard numbered list: '1. **title**\ndescription' (number first)
+    3. Bold-numbered list: '**1. title**\ndescription' (bold markers wrap number)
+    Also handles bullet lists: '- ...' or '• ...' or '* ...'
     """
     match = _SPROUT_SECTION_RE.search(note_content)
     if not match:
@@ -278,15 +280,18 @@ def _extract_directions_from_note(note_content):
         section_text = rest
 
     directions = []
-    # Split on: ### 方向 N headers, or numbered (1-99)/bulleted list items
-    for block in re.split(r'\n(?=###\s*方向\s*\d{1,2}[::]|\d{1,2}[\.\)\u3001\]]\s+|^[\-•\*]\s+)', section_text, flags=re.MULTILINE):
+    # Split on: ### 方向 N：headers, or numbered (1-99, optional ** prefix)/bulleted list items
+    for block in re.split(r'\n(?=###\s*方向\s*\d{1,2}[：:]|\*{0,2}\d{1,2}[\.\)\u3001\]]\s+|^[\-•\*]\s+)', section_text, flags=re.MULTILINE):
         block = block.strip()
         if not block:
             continue
-        # Remove leading ### 方向 N: prefix, then number/bullet markers
-        clean = re.sub(r'^(###\s*方向\s*\d{1,2}[::]\s*)?(\d{1,2}[\.\)\u3001\]]?|[\-•\*]\s*)*', '', block).strip()
+        # Remove leading ### 方向 N：prefix, then number/bullet markers (incl. ** bold wrappers)
+        clean = re.sub(r'^(###\s*方向\s*\d{1,2}[：:]\s*)?(\*{0,2}\d{1,2}[\.\)\u3001\]]?\s*\**|[\-•\*]\s*)*', '', block).strip()
         if clean and len(clean) > 5:
-            directions.append(clean)
+            # Strip residual ** markdown bold markers from the title line
+            lines = clean.split('\n')
+            lines[0] = re.sub(r'\*{2}', '', lines[0]).strip()
+            directions.append('\n'.join(lines).strip())
     return directions
 
 
@@ -1555,10 +1560,10 @@ def _complete(params):
         total = len(all_actions)
         done_count = sum(1 for a in all_actions if a['status'] in ('completed', 'skipped'))
 
-        # 查找下一个 queued 方向
+        # 查找下一个待执行方向（queued 优先，其次 pending 自动提升）
         next_queued = None
         for a in all_actions:
-            if a['status'] == 'queued':
+            if a['status'] in ('queued', 'pending'):
                 next_queued = a
                 break
 
@@ -1592,10 +1597,12 @@ def _complete(params):
                 'action_type': next_queued['action_type'],
                 'exec_prompt': next_queued.get('exec_prompt', ''),
             }
-            result['pipeline_completed'] = False
+            # pipeline_completed 基于实际完成数，而非 next_queued 是否存在
+            result['pipeline_completed'] = (done_count >= total)
         else:
             result['next_action'] = None
-            result['pipeline_completed'] = True
+            # 无下一个待执行方向，但仍按实际完成数判断
+            result['pipeline_completed'] = (done_count >= total)
 
         return result
     finally:
