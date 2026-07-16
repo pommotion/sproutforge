@@ -378,7 +378,7 @@ def _ai_extract_single(prompt, system_prompt):
             system_prompt=system_prompt,
             timeout_ms=90000,
         )
-        text = result if isinstance(result, str) else str(result)
+        text = _extract_prompt_output(result)
         text = text.strip()
         if text.startswith('```'):
             text = re.sub(r'^```(?:json)?\s*', '', text)
@@ -404,6 +404,17 @@ def _ai_extract_single(prompt, system_prompt):
 _SUMMARY_SYSTEM = 'You are a content analyst. Generate a concise, insightful summary of the given content. Write in the same language as the content. Output ONLY the summary text, no markdown fences, no headings.'
 
 
+def _extract_prompt_output(result):
+    """Extract text from run_prompt result.
+    run_prompt may return a str, or a dict like {ok, output, ...}.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return result.get('output', '') or result.get('text', '') or ''
+    return str(result)
+
+
 def _ai_generate_summary(content, title=''):
     """Generate a 3-5 sentence AI summary of the source content.
     Returns summary string, or '' on failure (non-fatal).
@@ -415,7 +426,7 @@ def _ai_generate_summary(content, title=''):
             system_prompt=_SUMMARY_SYSTEM,
             timeout_ms=30000,
         )
-        text = result if isinstance(result, str) else str(result)
+        text = _extract_prompt_output(result)
         text = text.strip()
         if text.startswith('```'):
             text = re.sub(r'^```(?:\w+)?\s*', '', text)
