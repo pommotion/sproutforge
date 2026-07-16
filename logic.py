@@ -623,7 +623,7 @@ def _ai_classify(directions, note_title='', kb_notes=None):
             system_prompt=_CLASSIFY_SYSTEM,
             timeout_ms=90000,
         )
-        text = result if isinstance(result, str) else str(result)
+        text = _extract_prompt_output(result)
         text = text.strip()
         # Strip code fences
         if text.startswith('```'):
@@ -1570,7 +1570,7 @@ def _merge_suggest(params):
         prompt = f'分析以下 {len(actions)} 个方向,找出高度相似/可合并的组:\n\n{items_json}\n\n只返回 JSON 数组,不要其他文字。'
         try:
             result = run_prompt(prompt=prompt, system_prompt=_MERGE_SYSTEM, timeout_ms=60000)
-            text = result if isinstance(result, str) else str(result)
+            text = _extract_prompt_output(result)
             text = text.strip()
             if text.startswith('```'):
                 text = re.sub(r'^```(?:json)?\s*', '', text)
