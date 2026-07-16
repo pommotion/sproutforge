@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta
 
 from remio_sdk import create_aapp_logger, get_state, router, run_prompt, set_state, syscall
 
@@ -115,6 +116,11 @@ def _uuid():
 
 def _now():
     return int(time.time())
+
+
+def _now_dt():
+    """Return current date as YYYY-MM-DD string (for note formatting)."""
+    return datetime.now().strftime('%Y-%m-%d')
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +435,7 @@ def _create_sprout_note(title, source_meta, summary, directions, raw_content):
     # Source info
     if source_meta and source_meta.get('url'):
         lines.append(f'> 来源: {source_meta.get("platform", "")} - {source_meta["url"]}')
-    lines.append(f'> 抓取时间: {_now()[:10]}')
+    lines.append(f'> 抓取时间: {_now_dt()}')
     lines.append('')
 
     # AI summary
@@ -1520,6 +1526,82 @@ def _confirm(params):
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# Merge suggest: AI 分析相似方向,合并/去重
+# ---------------------------------------------------------------------------
+
+_MERGE_SYSTEM = 'You are an editorial assistant. Analyze the given action directions and identify groups of highly similar or overlapping ones that should be merged. Output ONLY a JSON array of merge groups. Each group: {"keep": "<id to keep>", "merge": ["<ids to merge into keep>"], "merged_title": "<new title>", "reason": "<why merge>"}. If no similar groups exist, output []. Write in the same language as the content.'
+
+
+@router.route('POST', '/merge-suggest')
+def _merge_suggest(params):
+    source_id = (params.get('source_id') or '').strip()
+    note_id = (params.get('note_id') or '').strip()
+    auto_apply = (params.get('auto_apply') or '').strip().lower() in ('true', '1', 'yes')
+
+    if not source_id and not note_id:
+        return {'error': 'missing_source', 'message': '需要提供 source_id 或 note_id'}
+
+    db = _open_db()
+    try:
+        actions = db.query(
+            "SELECT * FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) AND status IN ('pending', 'queued') ORDER BY direction_index",
+            {'sid': source_id, 'nid': note_id}
+        )
+        if not actions:
+            return {'error': 'no_actions', 'message': '没有 pending/queued 的方向可分析'}
+        if len(actions) < 2:
+            return {'source_id': source_id or note_id, 'merge_groups': [], 'message': '方向不足 2 个,无需合并'}
+
+        items = [{'id': a['id'], 'title': a['title'], 'description': (a.get('description') or '')[:200], 'type': a['action_type']} for a in actions]
+        items_json = json.dumps(items, ensure_ascii=False)
+
+        prompt = f'分析以下 {len(actions)} 个方向,找出高度相似/可合并的组:\n\n{items_json}\n\n只返回 JSON 数组,不要其他文字。'
+        try:
+            result = run_prompt(prompt=prompt, system_prompt=_MERGE_SYSTEM, timeout_ms=60000)
+            text = result if isinstance(result, str) else str(result)
+            text = text.strip()
+            if text.startswith('```'):
+                text = re.sub(r'^```(?:json)?\s*', '', text)
+                text = re.sub(r'\s*```$', '', text)
+            array_match = re.search(r'\[.*\]', text, re.DOTALL)
+            if array_match:
+                text = array_match.group()
+            groups = json.loads(text)
+        except Exception as e:
+            LOGGER.warn('merge_suggest', 'AI analysis failed', {'error': str(e)})
+            return {'error': 'ai_failed', 'message': f'AI 分析失败: {e}'}
+
+        if not isinstance(groups, list):
+            groups = []
+
+        applied = []
+        if auto_apply and groups:
+            now = _now()
+            for g in groups:
+                keep_id = g.get('keep', '')
+                merge_ids = g.get('merge', [])
+                merged_title = g.get('merged_title', '')
+                if not keep_id or not merge_ids:
+                    continue
+                if merged_title:
+                    db.exec('UPDATE sprout_actions SET title = ?, updated_at = ? WHERE id = ?', [merged_title, now, keep_id])
+                for mid in merge_ids:
+                    db.exec('UPDATE sprout_actions SET status = ?, reason = ?, updated_at = ? WHERE id = ?', ['skipped', f'已合并到 {keep_id}', now, mid])
+                applied.append({'keep': keep_id, 'merged': merge_ids, 'merged_title': merged_title})
+            LOGGER.info('merge_suggest', f'auto-applied {len(applied)} merges', {'source_id': source_id})
+
+        return {
+            'source_id': source_id or note_id,
+            'total_actions': len(actions),
+            'merge_groups': groups,
+            'auto_applied': applied if auto_apply else [],
+            'message': f'识别 {len(groups)} 个合并组' + (f',已自动合并 {len(applied)} 组' if auto_apply and applied else '')
+        }
+    finally:
+        db.close()
+
+
 @router.route('POST', '/execute')
 def _execute(params):
     action_id = (params.get('action_id') or '').strip()
@@ -2006,6 +2088,161 @@ def _link_results(params):
             'related_notes_found': len(related_notes),
             'notes_added_to_collection': added_count,
             'vault_status': vault_status,
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Auto-schedule: 将 queued 方向排期到日历
+# ---------------------------------------------------------------------------
+
+@router.route('POST', '/auto-schedule')
+def _auto_schedule(params):
+    source_id = (params.get('source_id') or '').strip()
+    note_id = (params.get('note_id') or '').strip()
+    days_ahead = params.get('days_ahead', 7)
+    try:
+        days_ahead = int(days_ahead)
+    except (ValueError, TypeError):
+        days_ahead = 7
+    duration_min = params.get('duration_min', 90)
+    try:
+        duration_min = int(duration_min)
+    except (ValueError, TypeError):
+        duration_min = 90
+
+    if not source_id and not note_id:
+        return {'error': 'missing_source', 'message': '需要提供 source_id 或 note_id'}
+
+    db = _open_db()
+    try:
+        actions = db.query(
+            "SELECT * FROM sprout_actions WHERE (source_id = :sid OR note_id = :nid) AND status = 'queued' ORDER BY direction_index",
+            {'sid': source_id, 'nid': note_id}
+        )
+        if not actions:
+            return {'error': 'no_queued', 'message': '没有 queued 状态的方向可排期'}
+
+        # Find an available calendar
+        try:
+            cal_resp = syscall('list_calendars', {})
+            cal_data = cal_resp.get('data', cal_resp) if isinstance(cal_resp, dict) else {}
+            calendars = cal_data.get('calendars', [])
+        except Exception as e:
+            return {'error': 'calendar_unavailable', 'message': f'无法获取日历: {e}'}
+
+        if not calendars:
+            return {'error': 'no_calendar', 'message': '没有可用日历,请先连接日历账户'}
+
+        calendar_id = calendars[0]['id']
+        LOGGER.info('auto_schedule', f'using calendar {calendar_id}', {})
+
+        # Fetch existing events for the scheduling window
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        window_start = today.strftime('%Y-%m-%d')
+        window_end = (today + timedelta(days=days_ahead + 1)).strftime('%Y-%m-%d')
+
+        try:
+            search_params = {'time_filter': {'start': window_start, 'end': window_end}, 'limit': 100}
+            if isinstance(calendar_id, int) and calendar_id > 0:
+                search_params['calendarIds'] = [calendar_id]
+            ev_resp = syscall('search_events', search_params)
+            ev_data = ev_resp.get('data', ev_resp) if isinstance(ev_resp, dict) else {}
+            existing_events = ev_data.get('events', [])
+        except Exception:
+            existing_events = []
+
+        # Build busy time map: {date_str: [(start_minutes, end_minutes), ...]}
+        busy_map = {}
+        for ev in existing_events:
+            try:
+                st = datetime.fromisoformat(ev['startTime'])
+                et = datetime.fromisoformat(ev['endTime'])
+                date_key = st.strftime('%Y-%m-%d')
+                busy_map.setdefault(date_key, []).append((st.hour * 60 + st.minute, et.hour * 60 + et.minute))
+            except Exception:
+                continue
+
+        # Working hours in minutes: 9:00-12:00, 14:00-18:00
+        WORK_SLOTS = [(9 * 60, 12 * 60), (14 * 60, 18 * 60)]
+        PRIORITY_DAY_OFFSET = {'high': (0, 2), 'medium': (1, 4), 'low': (3, 7)}
+
+        def find_slot(priority):
+            offset_min, offset_max = PRIORITY_DAY_OFFSET.get(priority, (1, 4))
+            max_day = min(offset_max + 1, days_ahead + 1)
+            for day_offset in range(offset_min, max_day):
+                day = today + timedelta(days=day_offset)
+                date_key = day.strftime('%Y-%m-%d')
+                day_busy = sorted(busy_map.get(date_key, []))
+                for slot_start, slot_end in WORK_SLOTS:
+                    cursor = slot_start
+                    for busy_start, busy_end in day_busy:
+                        if busy_end <= cursor:
+                            continue
+                        if busy_start >= cursor + duration_min:
+                            break  # gap found before this busy block
+                        cursor = max(cursor, busy_end)
+                    if cursor + duration_min <= slot_end:
+                        start_dt = day.replace(hour=cursor // 60, minute=cursor % 60)
+                        end_min = cursor + duration_min
+                        end_dt = day.replace(hour=end_min // 60, minute=end_min % 60)
+                        return date_key, start_dt, end_dt
+            return None
+
+        scheduled = []
+        skipped = []
+        now = _now()
+
+        for a in actions:
+            priority = a.get('priority', 'medium')
+            slot = find_slot(priority)
+            if not slot:
+                skipped.append({'action_id': a['id'], 'title': a['title'], 'reason': '无空闲时段'})
+                continue
+
+            date_key, start_dt, end_dt = slot
+            title = f'🌱 {a["title"]}'
+            description = a.get('exec_prompt') or a.get('description') or ''
+
+            try:
+                ev_resp = syscall('create_event', {
+                    'calendarId': calendar_id,
+                    'title': title,
+                    'startTime': start_dt.isoformat(),
+                    'endTime': end_dt.isoformat(),
+                    'description': description[:2000],
+                })
+                ev_data = ev_resp.get('data', ev_resp) if isinstance(ev_resp, dict) else {}
+                event_id = ev_data.get('eventId', '')
+            except Exception as e:
+                LOGGER.warn('auto_schedule', f'create_event failed for {a["id"]}', {'error': str(e)})
+                skipped.append({'action_id': a['id'], 'title': a['title'], 'reason': f'日历创建失败: {e}'})
+                continue
+
+            db.exec('UPDATE sprout_actions SET status = ?, updated_at = ? WHERE id = ?', ['running', now, a['id']])
+            busy_map.setdefault(date_key, []).append((start_dt.hour * 60 + start_dt.minute, end_dt.hour * 60 + end_dt.minute))
+            scheduled.append({
+                'action_id': a['id'],
+                'title': a['title'],
+                'event_id': event_id,
+                'date': date_key,
+                'start': start_dt.strftime('%H:%M'),
+                'end': end_dt.strftime('%H:%M'),
+                'duration_min': duration_min,
+            })
+
+        _update_pipeline_progress(db, source_id or note_id)
+
+        LOGGER.info('auto_schedule', f'scheduled {len(scheduled)}/{len(actions)}', {'source_id': source_id})
+        return {
+            'source_id': source_id or note_id,
+            'total_queued': len(actions),
+            'scheduled_count': len(scheduled),
+            'skipped_count': len(skipped),
+            'scheduled': scheduled,
+            'skipped': skipped,
+            'message': f'已排期 {len(scheduled)}/{len(actions)} 个方向到日历'
         }
     finally:
         db.close()

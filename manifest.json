@@ -7,7 +7,7 @@
   },
   "icon": "🌱",
   "type": "aapp",
-  "version": "4.5",
+  "version": "4.6.1",
   "developer": "violin",
   "description": "从素材到执行的一体化入口。粘贴链接自动抓取生成发芽笔记，或 @ 任意笔记提取方向、AI 分类、生成执行计划、成果回链。",
   "descriptionI18n": {
@@ -56,6 +56,15 @@
         "method": "GET",
         "path": "/stats_ui",
         "prompt": "查看知识→行动转化仪表盘"
+      }
+    },
+    {
+      "label": "合并去重",
+      "labelI18n": { "zh-CN": "合并去重", "en-US": "Merge" },
+      "action": {
+        "method": "POST",
+        "path": "/merge-suggest",
+        "prompt": "AI 分析相似方向并提出合并建议"
       }
     }
   ]
